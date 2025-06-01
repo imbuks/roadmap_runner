@@ -1,0 +1,408 @@
+.vis-item {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+}
+
+.vis-item .vis-item-content {
+  padding: 0 12px !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  font-size: 14px !important;
+  color: inherit !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+}
+.vis-timeline {
+  border: 1px solid #E0E0E0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  background: #FFFFFF;
+  height: 100% !important;
+}
+
+/* Group styling */
+.vis-label {
+  padding: 0 16px !important;
+  border-bottom: 1px solid #eee !important;
+}
+
+.vis-labelset {
+  width: 200px !important;
+}
+
+.vis-group {
+  border-bottom: 1px solid #eee !important;
+}
+
+.custom-group {
+  display: flex !important;
+  align-items: center !important;
+  padding: 0 16px !important;
+}
+
+.group-label {
+  color: white;
+  font-weight: 500;
+  font-size: 14px;
+}
+
+/* Timeline items */
+.timeline-item {
+  border-radius: 6px !important;
+  height: 40px !important;
+  margin-top: 20px !important;
+  margin-bottom: 20px !important;
+  border: none !important;
+}
+
+.vis-item.vis-range {
+  border: none !important;
+}
+
+.vis-item .vis-item-content {
+  padding: 0 12px !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  font-size: 14px !important;
+}
+
+/* Grid lines */
+.vis-time-axis .vis-grid.vis-minor {
+  border-color: #eee !important;
+  border-width: 1px !important;
+  border-style: dotted !important;
+}
+
+.vis-panel.vis-center,
+.vis-panel.vis-left,
+.vis-panel.vis-right {
+  border: none !important;
+}
+
+.vis-panel.vis-center {
+  border-top: 1px solid #eee !important;
+}
+
+/* Current time marker */
+.vis-current-time {
+  background-color: rgba(255, 99, 71, 0.2) !important;
+  width: 1px !important;
+}
+
+/* Title styling */
+.vis-timeline::before {
+  content: 'LATEST VERSION - APR 2025';
+  position: absolute;
+  top: -40px;
+  left: 0;
+  font-size: 18px;
+  font-weight: bold;
+  color: #1a237e;
+}
+
+
+.vis-item.vis-selected {
+  border: none !important;
+  background-color: transparent !important;
+}
+
+.vis-time-axis .vis-grid.vis-major {
+  border-width: 0 0 0 1px !important;
+  border-color: rgba(224, 224, 224, 0.3) !important;
+  border-style: dotted !important;
+}
+
+/* Make capability background fill entire cell */
+.vis-group {
+  margin: 0 !important;
+  padding: 0 !important;
+  width: 100% !important;
+  height: 100px !important;
+  display: block !important;
+  position: relative !important;
+  border-bottom: 1px solid rgba(224, 224, 224, 0.3) !important;
+}
+
+.rotated-label {
+  transform: rotate(-90deg);
+  transform-origin: center;
+  position: absolute;
+  left: 40px;
+  width: 80px;
+  height: 30px;
+  line-height: 30px;
+  text-align: center;
+  white-space: nowrap;
+  font-weight: bold;
+  z-index: 1;
+}
+
+/* Ensure the timeline content area fills available space */
+.vis-content {
+  left: 200px !important; /* Match labelset width */
+}
+
+/* Remove any gaps between groups */
+.vis-foreground .vis-group {
+  border-bottom: 1px solid #e0e0e0 !important;
+  margin-bottom: -1px !important;
+}
+
+.group-title {
+  font-weight: bold;
+  font-size: 14px;
+  padding: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vis-panel.vis-left {
+  width: 200px !important;
+  min-width: 200px !important;
+  max-width: 220px !important;
+  border-right: 1px solid #E0E0E0 !important;
+}
+
+/* Timeline item styling */
+.timeline-item {
+  height: 50px !important;
+  line-height: 50px !important;
+  margin: 25px 8px !important;
+  border-radius: 6px !important;
+  font-size: 14px !important;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1) !important;
+  border: none !important;
+}
+
+.vis-item .vis-item-content {
+  position: relative !important;
+  left: 0 !important;
+  width: calc(100% - 24px) !important;
+  padding: 0 12px !important;
+  text-align: center !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+  font-weight: 500 !important;
+}
+
+/* Time axis styling */
+.vis-time-axis {
+  background-color: white;
+}
+
+/* Time axis styling */
+.vis-time-axis .vis-text {
+  font-size: 12px !important;
+  color: #666 !important;
+  padding: 8px 0 !important;
+}
+
+.vis-time-axis .vis-text.vis-major {
+  font-weight: 600 !important;
+}
+
+/* Ensure proper vertical spacing between groups */
+.vis-group {
+  margin-top: 1px !important;
+  margin-bottom: 1px !important;
+}
+
+/* Remove item customization handles */
+/* .vis-item .vis-item-overflow {
+  display: none !important;
+} */
+
+/* Remove background from item ranges */
+
+/* Capability Labels Area (Left Panel) */
+.vis-panel.vis-left {
+  width: 200px !important;
+  min-width: 200px !important;
+  max-width: 220px !important;
+  border-right: 1px solid #E0E0E0 !important;
+}
+
+.vis-labelset .vis-label {
+  width: 200px !important;
+  min-width: 200px !important;
+  max-width: 220px !important;
+  font-size: 16px !important;
+  font-weight: bold !important;
+  padding-left: 12px !important;
+  overflow: visible !important;
+  white-space: nowrap !important;
+  text-overflow: ellipsis !important;
+  display: flex !important;
+  align-items: center !important;
+  background: none !important;
+}
+
+/* Capability Group Template Styling (applied via JS groupTemplate) */
+.vis-group-template {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  padding-left: 15px;
+  font-weight: 500;
+  font-size: 14px;
+  box-sizing: border-box;
+}
+
+/* Feature Items Area (Center Panel) */
+.vis-panel.vis-center {
+  border-top: 1px solid #E0E0E0 !important;
+}
+
+/* Feature Item Styling - OUTER CONTAINER (created by vis-timeline) */
+.timeline-feature-item {
+  height: 40px !important; 
+  border-radius: 6px !important;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24);
+  margin: 5px 5px !important; 
+  border: none !important; /* No border on the library's item div */
+  padding: 0 !important; /* No padding on the library's item div */
+  /* Make this a flex container that stretches its child (our template's output) */
+  display: flex !important; 
+  align-items: stretch !important;
+  justify-content: stretch !important;
+  overflow: hidden; /* Clip the content wrapper if it somehow tries to overflow */
+}
+
+/* Feature Item Styling - INNER CONTENT WRAPPER (created by our itemTemplate) */
+
+
+/* Time Axis Styling */
+.vis-time-axis {
+  background-color: #F8F9FA;
+  height: auto !important;
+}
+
+.vis-time-axis .vis-text {
+  font-size: 12px !important;
+  color: #495057 !important;
+  padding-top: 5px !important;
+  padding-bottom: 5px !important;
+  line-height: 1.2;
+}
+
+.vis-time-axis .vis-text.vis-major {
+  font-weight: 600 !important;
+  color: #212529 !important;
+}
+
+/* Grid Lines Styling */
+.vis-time-axis .vis-grid.vis-minor {
+  border-left: 1px dotted #DDE1E3 !important;
+  border-width: 0 0 0 1px !important;
+}
+
+.vis-time-axis .vis-grid.vis-major {
+  border-left: 1px dotted #CED4DA !important;
+  border-width: 0 0 0 1px !important;
+}
+
+/* Current Time Marker */
+.vis-current-item { /* Note: This was .vis-current-time, but image shows .vis-current-item. Check which is correct in vis-timeline docs if it doesn't work */
+  background-color: #FF4E50 !important;
+  width: 2px !important;
+  z-index: 10;
+}
+
+/* Selection Styling */
+.vis-item.vis-selected .timeline-feature-item-content-wrapper {
+  /* Style the wrapper when the item is selected */
+  border: 2px solid #007BFF !important; 
+  /* box-shadow: 0 0 5px rgba(0,123,255,0.5) !important; */ /* Shadow on wrapper can be too much */
+}
+.vis-item.vis-selected {
+    /* Remove default vis-timeline selection border if using custom on wrapper */
+    border: none !important;
+    background: none !important; 
+}
+
+.vis-center .vis-group {
+    background: none !important;
+    border: none !important;
+    min-height: 80px !important;
+}
+
+/* Allow inline text colors to show for vis-item-content */
+.vis-item-content {
+  color: inherit !important;
+}
+/* Ensure vis-item centers its content */
+.vis-item {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+}
+
+/* Force display of item content */
+.vis-item, 
+.vis-item.vis-range,
+.vis-item .vis-item-content {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+}
+
+/* Ensure no ancestor is hiding the content */
+.vis-item * {
+  display: inherit !important;
+  visibility: inherit !important;
+  opacity: inherit !important;
+}
+
+/* Style default vis-label-content for capabilities using vertical writing mode */
+.vis-label .vis-label-content {
+  writing-mode: vertical-rl !important;
+  text-orientation: sideways !important;
+  font-weight: 500 !important;
+  font-size: 14px !important;
+  line-height: 1.2 !important;
+  white-space: nowrap !important;
+  overflow: visible !important;
+  color: inherit !important;
+  padding: 0 !important;
+  margin: 0 auto !important;
+}
+
+/* Ensure the label cell centers the rotated text */
+.vis-label {
+  position: relative !important;
+  height: 80px !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  overflow: visible !important; /* allow rotated text to overflow */
+  padding-left: 0 !important; /* Remove extra left padding */
+}
+
+/* Restore month/year labels on the time axis */
+.vis-time-axis .vis-text {
+  display: inline !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+}
+
+/* Ensure the label cell and inner wrapper fill the full height */
+.vis-label {
+  display: flex !important;
+  align-items: center !important;
+}
+
+/* Remove any additional rotation or conflicting rules for .vis-label or .vis-label-content below this point */
+/* .vis-label .vis-label-content {
+  height: 100% !important;
+} */
