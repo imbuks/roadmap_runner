@@ -1,12 +1,27 @@
 import React, { useState, useEffect, useRef } from "react";
 import Timeline from "./components/Timeline";
 import { DataGrid, GridActionsCellItem } from '@mui/x-data-grid';
-import { Button, Box, TextField, MenuItem, Dialog, DialogTitle, DialogContent, DialogActions, Menu, MenuItem as MuiMenuItem, IconButton } from '@mui/material';
+import { 
+  Button, 
+  Box, 
+  TextField, 
+  MenuItem, 
+  Dialog, 
+  DialogTitle, 
+  DialogContent, 
+  DialogActions, 
+  Menu, 
+  MenuItem as MuiMenuItem,
+  Collapse,
+  Typography
+} from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import SaveIcon from '@mui/icons-material/Save';
 import FileDownloadIcon from '@mui/icons-material/FileDownload';
 import FileUploadIcon from '@mui/icons-material/FileUpload';
 import ClearAllIcon from '@mui/icons-material/ClearAll';
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
+import ExpandLessIcon from '@mui/icons-material/ExpandLess';
 import moment from 'moment';
 import html2canvas from 'html2canvas';
 import jsPDF from 'jspdf';
@@ -28,6 +43,7 @@ function App() {
     endDate: ''
   });
   const [clearDialogOpen, setClearDialogOpen] = useState(false);
+  const [tableExpanded, setTableExpanded] = useState(true);
 
   // Load data from localStorage on component mount
   useEffect(() => {
@@ -304,77 +320,107 @@ function App() {
     setClearDialogOpen(false);
   };
 
+  const toggleTable = () => {
+    setTableExpanded(!tableExpanded);
+  };
+
   return (
     <div style={{ padding: 20 }}>
       <h1>Roadmap Runner</h1>
-      <Box sx={{ height: 400, width: '100%', marginBottom: 2 }}>
-        <Box sx={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
-          <Box sx={{ display: 'flex', gap: 2 }}>
-            <Button variant="contained" onClick={() => setOpenDialog(true)}>
-              Add New Item
-            </Button>
-            <Button
-              variant="contained"
-              color="primary"
-              startIcon={<FileDownloadIcon />}
-              onClick={handleExportClick}
-              disabled={!visible || rows.length === 0}
-            >
-              Export
-            </Button>
-            <Button
-              variant="contained"
-              color="secondary"
-              startIcon={<FileUploadIcon />}
-              onClick={handleImportClick}
-            >
-              Import CSV
-            </Button>
-            <Button
-              variant="contained"
-              color="error"
-              startIcon={<ClearAllIcon />}
-              onClick={handleClearAll}
-              disabled={rows.length === 0}
-            >
-              Clear All
-            </Button>
-            <input
-              type="file"
-              ref={fileInputRef}
-              style={{ display: 'none' }}
-              accept=".csv"
-              onChange={handleFileUpload}
-            />
-            <Menu
-              anchorEl={anchorEl}
-              open={Boolean(anchorEl)}
-              onClose={handleExportClose}
-            >
-              <MuiMenuItem onClick={handleExportPNG}>Export as PNG</MuiMenuItem>
-              <MuiMenuItem onClick={handleExportPDF}>Export as PDF</MuiMenuItem>
-              <MuiMenuItem onClick={handleExportCSV}>Export as CSV</MuiMenuItem>
-            </Menu>
-          </Box>
-          <Button variant="contained" color="primary" startIcon={<SaveIcon />} onClick={handleSave}>
-            Save
-          </Button>
+      <Box sx={{ width: '100%', marginBottom: 2 }}>
+        <Box 
+          sx={{ 
+            display: 'flex', 
+            justifyContent: 'space-between', 
+            alignItems: 'center',
+            marginBottom: 2,
+            backgroundColor: '#f5f5f5',
+            padding: '8px 16px',
+            borderRadius: '4px'
+          }}
+          onClick={toggleTable}
+          style={{ cursor: 'pointer' }}
+        >
+          <Typography variant="h6" component="div">
+            Data Table
+          </Typography>
+          {tableExpanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
         </Box>
-        <DataGrid
-          rows={rows}
-          columns={columns}
-          processRowUpdate={handleRowUpdate}
-          experimentalFeatures={{ newEditingApi: true }}
-        />
+
+        <Collapse in={tableExpanded}>
+          <Box sx={{ height: 400, width: '100%', marginBottom: 2 }}>
+            <Box sx={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+              <Box sx={{ display: 'flex', gap: 2 }}>
+                <Button variant="contained" onClick={() => setOpenDialog(true)}>
+                  Add New Item
+                </Button>
+                <Button
+                  variant="contained"
+                  color="secondary"
+                  startIcon={<FileUploadIcon />}
+                  onClick={handleImportClick}
+                >
+                  Import CSV
+                </Button>
+                <Button
+                  variant="contained"
+                  color="error"
+                  startIcon={<ClearAllIcon />}
+                  onClick={handleClearAll}
+                  disabled={rows.length === 0}
+                >
+                  Clear All
+                </Button>
+                <input
+                  type="file"
+                  ref={fileInputRef}
+                  style={{ display: 'none' }}
+                  accept=".csv"
+                  onChange={handleFileUpload}
+                />
+              </Box>
+              <Button variant="contained" color="primary" startIcon={<SaveIcon />} onClick={handleSave}>
+                Save
+              </Button>
+            </Box>
+            <DataGrid
+              rows={rows}
+              columns={columns}
+              processRowUpdate={handleRowUpdate}
+              experimentalFeatures={{ newEditingApi: true }}
+            />
+          </Box>
+        </Collapse>
       </Box>
-      <Button
-        variant="contained"
-        onClick={() => setVisible(true)}
-        sx={{ marginBottom: 2 }}
-        disabled={rows.length === 0}
-      >
-        Generate Timeline
-      </Button>
+
+      <Box sx={{ display: 'flex', gap: 2, marginBottom: 2 }}>
+        <Button
+          variant="contained"
+          onClick={() => setVisible(true)}
+          disabled={rows.length === 0}
+        >
+          Generate Timeline
+        </Button>
+        <Button
+          variant="contained"
+          color="primary"
+          startIcon={<FileDownloadIcon />}
+          onClick={handleExportClick}
+          disabled={!visible || rows.length === 0}
+        >
+          Export
+        </Button>
+        <Menu
+          anchorEl={anchorEl}
+          open={Boolean(anchorEl)}
+          onClose={handleExportClose}
+        >
+          <MuiMenuItem onClick={handleExportPNG}>Export as PNG</MuiMenuItem>
+          <MuiMenuItem onClick={handleExportPDF}>Export as PDF</MuiMenuItem>
+          <MuiMenuItem onClick={handleExportCSV}>Export as CSV</MuiMenuItem>
+        </Menu>
+      </Box>
+
       {visible && (
         <div ref={timelineRef} style={{ border: '1px solid #ddd', padding: '10px', marginTop: '20px' }}>
           <Timeline groups={groups} items={items} options={options} />
