@@ -18,26 +18,29 @@ export default function TimelineWrapper({ groups, items, options }) {
       canMove={false}
       canResize={false}
       stackItems
-      itemHeightRatio={0.75}
-      lineHeight={60}
-      groupHeight={80}
-      sidebarWidth={220}
-      itemRenderer={({ item, getItemProps, getResizeProps }) => (
+      itemHeightRatio={0.6}
+      lineHeight={100}
+      sidebarWidth={80}
+      headerLabelGroupHeight={40}
+      headerLabelHeight={40}
+      minZoom={24 * 60 * 60 * 1000}
+      maxZoom={365.24 * 86400 * 1000}
+      itemRenderer={({ item, getItemProps }) => (
         <div {...getItemProps({
           style: {
             ...item.style,
             borderRadius: 6,
-            boxShadow: '0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24)',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            fontWeight: 'bold',
-            fontSize: 15,
-            padding: '0 12px',
+            fontWeight: 500,
+            fontSize: 14,
+            padding: '0 16px',
             overflow: 'hidden',
             textOverflow: 'ellipsis',
             whiteSpace: 'nowrap',
-            height: '100%'
+            height: '100%',
+            cursor: 'default'
           }
         })}>
           {item.title}
@@ -48,16 +51,16 @@ export default function TimelineWrapper({ groups, items, options }) {
           background: group.bgColor,
           color: group.textColor,
           height: '100%',
+          width: '100%',
           display: 'flex',
           alignItems: 'center',
-          fontWeight: 'bold',
-          fontSize: 16,
-          paddingLeft: 12,
-          whiteSpace: 'nowrap',
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
+          justifyContent: 'center',
+          fontWeight: 500,
+          fontSize: 14
         }}>
-          {group.title}
+          <div style={{ transform: 'rotate(-90deg)', whiteSpace: 'nowrap' }}>
+            {group.title}
+          </div>
         </div>
       )}
     />

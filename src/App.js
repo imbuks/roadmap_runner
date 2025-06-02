@@ -1,14 +1,22 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import Timeline from "./components/Timeline";
 import { DataGrid, GridActionsCellItem } from '@mui/x-data-grid';
-import { Button, Box, TextField, MenuItem, Dialog, DialogTitle, DialogContent, DialogActions } from '@mui/material';
+import { Button, Box, TextField, MenuItem, Dialog, DialogTitle, DialogContent, DialogActions, Menu, MenuItem as MuiMenuItem, IconButton } from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import SaveIcon from '@mui/icons-material/Save';
+import FileDownloadIcon from '@mui/icons-material/FileDownload';
+import FileUploadIcon from '@mui/icons-material/FileUpload';
+import ClearAllIcon from '@mui/icons-material/ClearAll';
 import moment from 'moment';
+import html2canvas from 'html2canvas';
+import jsPDF from 'jspdf';
 import "react-calendar-timeline/dist/style.css";
 import "./styles/Timeline.css";
 
 function App() {
+  const timelineRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const [anchorEl, setAnchorEl] = useState(null);
   const [visible, setVisible] = useState(false);
   const [rows, setRows] = useState([]);
   const [openDialog, setOpenDialog] = useState(false);
@@ -19,6 +27,7 @@ function App() {
     startDate: '',
     endDate: ''
   });
+  const [clearDialogOpen, setClearDialogOpen] = useState(false);
 
   // Load data from localStorage on component mount
   useEffect(() => {
@@ -44,7 +53,9 @@ function App() {
     { name: 'Duty Preparation', color: '#FFE0A0' },
     { name: 'Pre-Flight (Day of Ops)', color: '#E07A6C' },
     { name: 'Post-Flight', color: '#6D4C41' },
-    { name: 'Communication & Engagement', color: '#7BA7D0' }
+    { name: 'Communication & Engagement', color: '#7BA7D0' },
+    { name: 'Safety & Emegency', color: '#EA632B' },
+    { name: 'Performance & HR', color: '#F15C75' }
   ];
 
   const getContrastingTextColor = (hexColor) => {
@@ -172,14 +183,179 @@ function App() {
     setOpenDialog(false);
   };
 
+  const handleExportClick = (event) => {
+    setAnchorEl(event.currentTarget);
+  };
+
+  const handleExportClose = () => {
+    setAnchorEl(null);
+  };
+
+  const handleExportPNG = async () => {
+    if (timelineRef.current) {
+      try {
+        const canvas = await html2canvas(timelineRef.current, {
+          scale: 2,
+          backgroundColor: '#ffffff',
+          logging: false
+        });
+        
+        const link = document.createElement('a');
+        link.download = 'roadmap.png';
+        link.href = canvas.toDataURL('image/png');
+        link.click();
+      } catch (error) {
+        console.error('Error exporting PNG:', error);
+      }
+    }
+    handleExportClose();
+  };
+
+  const handleExportPDF = async () => {
+    if (timelineRef.current) {
+      try {
+        const canvas = await html2canvas(timelineRef.current, {
+          scale: 2,
+          backgroundColor: '#ffffff',
+          logging: false
+        });
+        
+        const imgData = canvas.toDataURL('image/png');
+        const pdf = new jsPDF({
+          orientation: 'landscape',
+          unit: 'px',
+          format: [canvas.width, canvas.height]
+        });
+        
+        pdf.addImage(imgData, 'PNG', 0, 0, canvas.width, canvas.height);
+        pdf.save('roadmap.pdf');
+      } catch (error) {
+        console.error('Error exporting PDF:', error);
+      }
+    }
+    handleExportClose();
+  };
+
+  const handleExportCSV = () => {
+    if (rows.length === 0) return;
+
+    const headers = ['id', 'capability', 'feature', 'startDate', 'endDate'];
+    const csvContent = [
+      headers.join(','),
+      ...rows.map(row => headers.map(header => row[header]).join(','))
+    ].join('\n');
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'roadmap_data.csv';
+    link.click();
+    handleExportClose();
+  };
+
+  const handleImportClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileUpload = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const text = e.target?.result;
+        if (!text) return;
+
+        const lines = text.split('\n');
+        const headers = lines[0].split(',');
+        const newRows = lines.slice(1)
+          .filter(line => line.trim())
+          .map((line, index) => {
+            const values = line.split(',');
+            const row = {};
+            headers.forEach((header, i) => {
+              row[header.trim()] = values[i]?.trim();
+            });
+            // Ensure ID is unique if not provided in CSV
+            row.id = row.id || Math.max(...rows.map(r => r.id), 0) + index + 1;
+            return row;
+          });
+
+        setRows(newRows);
+        localStorage.setItem('roadmapData', JSON.stringify(newRows));
+      } catch (error) {
+        console.error('Error parsing CSV:', error);
+        alert('Error parsing CSV file. Please ensure the file is properly formatted.');
+      }
+    };
+    reader.readAsText(file);
+    event.target.value = ''; // Reset file input
+  };
+
+  const handleClearAll = () => {
+    setClearDialogOpen(true);
+  };
+
+  const handleConfirmClear = () => {
+    setRows([]);
+    setVisible(false);
+    localStorage.removeItem('roadmapData');
+    setClearDialogOpen(false);
+  };
+
   return (
     <div style={{ padding: 20 }}>
-      <h2>Product Roadmap Timeline</h2>
+      <h1>Roadmap Runner</h1>
       <Box sx={{ height: 400, width: '100%', marginBottom: 2 }}>
         <Box sx={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
-          <Button variant="contained" onClick={() => setOpenDialog(true)}>
-            Add New Item
-          </Button>
+          <Box sx={{ display: 'flex', gap: 2 }}>
+            <Button variant="contained" onClick={() => setOpenDialog(true)}>
+              Add New Item
+            </Button>
+            <Button
+              variant="contained"
+              color="primary"
+              startIcon={<FileDownloadIcon />}
+              onClick={handleExportClick}
+              disabled={!visible || rows.length === 0}
+            >
+              Export
+            </Button>
+            <Button
+              variant="contained"
+              color="secondary"
+              startIcon={<FileUploadIcon />}
+              onClick={handleImportClick}
+            >
+              Import CSV
+            </Button>
+            <Button
+              variant="contained"
+              color="error"
+              startIcon={<ClearAllIcon />}
+              onClick={handleClearAll}
+              disabled={rows.length === 0}
+            >
+              Clear All
+            </Button>
+            <input
+              type="file"
+              ref={fileInputRef}
+              style={{ display: 'none' }}
+              accept=".csv"
+              onChange={handleFileUpload}
+            />
+            <Menu
+              anchorEl={anchorEl}
+              open={Boolean(anchorEl)}
+              onClose={handleExportClose}
+            >
+              <MuiMenuItem onClick={handleExportPNG}>Export as PNG</MuiMenuItem>
+              <MuiMenuItem onClick={handleExportPDF}>Export as PDF</MuiMenuItem>
+              <MuiMenuItem onClick={handleExportCSV}>Export as CSV</MuiMenuItem>
+            </Menu>
+          </Box>
           <Button variant="contained" color="primary" startIcon={<SaveIcon />} onClick={handleSave}>
             Save
           </Button>
@@ -200,7 +376,7 @@ function App() {
         Generate Timeline
       </Button>
       {visible && (
-        <div style={{ border: '1px solid #ddd', padding: '10px', marginTop: '20px' }}>
+        <div ref={timelineRef} style={{ border: '1px solid #ddd', padding: '10px', marginTop: '20px' }}>
           <Timeline groups={groups} items={items} options={options} />
         </div>
       )}
@@ -257,6 +433,21 @@ function App() {
         <DialogActions>
           <Button onClick={() => { setOpenDialog(false); setFormErrors({}); }}>Cancel</Button>
           <Button onClick={handleAddRow} variant="contained">Add</Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
+        open={clearDialogOpen}
+        onClose={() => setClearDialogOpen(false)}
+      >
+        <DialogTitle>Clear All Data?</DialogTitle>
+        <DialogContent>
+          Are you sure you want to clear all data? This action cannot be undone.
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setClearDialogOpen(false)}>Cancel</Button>
+          <Button onClick={handleConfirmClear} color="error" variant="contained">
+            Clear All
+          </Button>
         </DialogActions>
       </Dialog>
     </div>
