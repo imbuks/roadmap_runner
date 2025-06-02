@@ -327,7 +327,8 @@ function App() {
   return (
     <div style={{ padding: 20 }}>
       <h1>Roadmap Runner</h1>
-      <Box sx={{ width: '100%', marginBottom: 2 }}>
+    
+      <Box sx={{ width: '100%' }}>
         <Box 
           sx={{ 
             display: 'flex', 
@@ -393,7 +394,7 @@ function App() {
         </Collapse>
       </Box>
 
-      <Box sx={{ display: 'flex', gap: 2, marginBottom: 2 }}>
+      <Box sx={{ display: 'flex', gap: 2, pt:8, pb:1}}>
         <Button
           variant="contained"
           onClick={() => setVisible(true)}
@@ -421,11 +422,14 @@ function App() {
         </Menu>
       </Box>
 
-      {visible && (
-        <div ref={timelineRef} style={{ border: '1px solid #ddd', padding: '10px', marginTop: '20px' }}>
+<Box>
+{visible && (
+        <div ref={timelineRef} style={{ border: '1px solid #ddd', padding: '10px'}}>
           <Timeline groups={groups} items={items} options={options} />
         </div>
       )}
+</Box>
+    
       <Dialog open={openDialog} onClose={() => { setOpenDialog(false); setFormErrors({}); }}>
         <DialogTitle>Add New Item</DialogTitle>
         <DialogContent>
