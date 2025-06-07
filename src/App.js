@@ -13,8 +13,10 @@ import {
   Menu, 
   MenuItem as MuiMenuItem,
   Collapse,
-  Typography
+  Typography,
+  IconButton
 } from '@mui/material';
+import ColorLensIcon from '@mui/icons-material/ColorLens';
 import DeleteIcon from '@mui/icons-material/Delete';
 import SaveIcon from '@mui/icons-material/Save';
 import FileDownloadIcon from '@mui/icons-material/FileDownload';
@@ -96,11 +98,73 @@ function App() {
     return null;
   };
 
+  // Add a new ColorPicker component
+  function CustomColorPicker({ capability, onColorChange }) {
+    const [open, setOpen] = useState(false);
+    const cap = capabilities.find(c => c.name === capability);
+    const defaultColor = cap ? cap.color : '#000000';
+
+    const handleChange = (event) => {
+      onColorChange(event.target.value);
+    };
+
+    return (
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        <Box
+          sx={{
+            width: 24,
+            height: 24,
+            borderRadius: '4px',
+            bgcolor: defaultColor,
+            border: '1px solid #ccc'
+          }}
+        />
+        <input
+          type="color"
+          value={defaultColor}
+          onChange={handleChange}
+          style={{ 
+            opacity: 0,
+            width: 0,
+            height: 0,
+            position: 'absolute'
+          }}
+        />
+        <IconButton
+          size="small"
+          onClick={() => document.querySelector('input[type="color"]').click()}
+        >
+          <ColorLensIcon fontSize="small" />
+        </IconButton>
+      </Box>
+    );
+  }
+
   const columns = [
     { field: 'capability', headerName: 'Capability', width: 200, editable: true },
     { field: 'feature', headerName: 'Feature', width: 250, editable: true },
     { field: 'startDate', headerName: 'Start Date', width: 130, editable: true, type: 'date', valueFormatter: (startDate) => { if (!startDate) return ''; return new Date(startDate).toLocaleDateString(); } },
     { field: 'endDate', headerName: 'End Date', width: 130, editable: true, type: 'date', valueFormatter: (endDate) => { if (!endDate) return ''; return new Date(endDate).toLocaleDateString(); } },
+    {
+      field: 'color',
+      headerName: 'Color',
+      width: 100,
+      renderCell: (params) => (
+        <CustomColorPicker
+          capability={params.row.capability}
+          onColorChange={(newColor) => {
+            const updatedCapabilities = capabilities.map(cap => 
+              cap.name === params.row.capability ? { ...cap, color: newColor } : cap
+            );
+            // Update capabilities array
+            capabilities.splice(0, capabilities.length, ...updatedCapabilities);
+            // Force a re-render of the timeline
+            const updatedRows = [...rows];
+            setRows(updatedRows);
+          }}
+        />
+      )
+    },
     {
       field: 'actions',
       type: 'actions',
