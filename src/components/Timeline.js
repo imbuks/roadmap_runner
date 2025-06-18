@@ -72,7 +72,7 @@ export default function TimelineWrapper({ groups, items, options }) {
         stackItems
         itemHeightRatio={0.6}
         lineHeight={100}
-        sidebarWidth={80}
+        sidebarWidth={130}
         headerLabelGroupHeight={40}
         headerLabelHeight={40}
         minZoom={ZOOM_LEVELS.ONE_MONTH}
@@ -112,7 +112,7 @@ export default function TimelineWrapper({ groups, items, options }) {
             fontWeight: 500,
             fontSize: 14
           }}>
-            <div style={{ transform: 'rotate(-90deg)', whiteSpace: 'nowrap' }}>
+            <div>
               {group.title}
             </div>
           </div>
