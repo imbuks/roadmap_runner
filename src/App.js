@@ -29,6 +29,8 @@ import html2canvas from 'html2canvas';
 import jsPDF from 'jspdf';
 import "react-calendar-timeline/dist/style.css";
 import "./styles/Timeline.css";
+import { BrowserRouter as Router, Routes, Route, Link } from 'react-router-dom';
+import JiraStories from './components/JiraStories';
 
 function App() {
   const timelineRef = useRef(null);
@@ -389,182 +391,195 @@ function App() {
   };
 
   return (
-    <div style={{ padding: 20 }}>
-      <h1>Roadmap Runner</h1>
-    
-      <Box sx={{ width: '100%' }}>
-        <Box 
-          sx={{ 
-            display: 'flex', 
-            justifyContent: 'space-between', 
-            alignItems: 'center',
-            marginBottom: 2,
-            backgroundColor: '#f5f5f5',
-            padding: '8px 16px',
-            borderRadius: '4px'
-          }}
-          onClick={toggleTable}
-          style={{ cursor: 'pointer' }}
-        >
-          <Typography variant="h6" component="div">
-            Data Table
-          </Typography>
-          {tableExpanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+    <Router>
+      <div style={{ padding: 20 }}>
+        <Box sx={{ mb: 3, display: 'flex', gap: 2 }}>
+          <Button component={Link} to="/" variant="outlined">Roadmap Runner</Button>
+          <Button component={Link} to="/jira-stories" variant="outlined">Jira Stories</Button>
         </Box>
-
-        <Collapse in={tableExpanded}>
-          <Box sx={{ height: 400, width: '100%', marginBottom: 2 }}>
-            <Box sx={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
-              <Box sx={{ display: 'flex', gap: 2 }}>
-                <Button variant="contained" onClick={() => setOpenDialog(true)}>
-                  Add New Item
-                </Button>
-                <Button
-                  variant="contained"
-                  color="secondary"
-                  startIcon={<FileUploadIcon />}
-                  onClick={handleImportClick}
+        <Routes>
+          <Route path="/jira-stories" element={<JiraStories />} />
+          <Route path="/" element={
+            <>
+              <h1>Roadmap Runner</h1>
+            
+              <Box sx={{ width: '100%' }}>
+                <Box 
+                  sx={{ 
+                    display: 'flex', 
+                    justifyContent: 'space-between', 
+                    alignItems: 'center',
+                    marginBottom: 2,
+                    backgroundColor: '#f5f5f5',
+                    padding: '8px 16px',
+                    borderRadius: '4px'
+                  }}
+                  onClick={toggleTable}
+                  style={{ cursor: 'pointer' }}
                 >
-                  Import CSV
-                </Button>
+                  <Typography variant="h6" component="div">
+                    Data Table
+                  </Typography>
+                  {tableExpanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+                </Box>
+
+                <Collapse in={tableExpanded}>
+                  <Box sx={{ height: 400, width: '100%', marginBottom: 2 }}>
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+                      <Box sx={{ display: 'flex', gap: 2 }}>
+                        <Button variant="contained" onClick={() => setOpenDialog(true)}>
+                          Add New Item
+                        </Button>
+                        <Button
+                          variant="contained"
+                          color="secondary"
+                          startIcon={<FileUploadIcon />}
+                          onClick={handleImportClick}
+                        >
+                          Import CSV
+                        </Button>
+                        <Button
+                          variant="contained"
+                          color="error"
+                          startIcon={<ClearAllIcon />}
+                          onClick={handleClearAll}
+                          disabled={rows.length === 0}
+                        >
+                          Clear All
+                        </Button>
+                        <input
+                          type="file"
+                          ref={fileInputRef}
+                          style={{ display: 'none' }}
+                          accept=".csv"
+                          onChange={handleFileUpload}
+                        />
+                      </Box>
+                      <Button variant="contained" color="primary" startIcon={<SaveIcon />} onClick={handleSave}>
+                        Save
+                      </Button>
+                    </Box>
+                    <DataGrid
+                      rows={rows}
+                      columns={columns}
+                      processRowUpdate={handleRowUpdate}
+                      experimentalFeatures={{ newEditingApi: true }}
+                    />
+                  </Box>
+                </Collapse>
+              </Box>
+
+              <Box sx={{ display: 'flex', gap: 2, pt:8, pb:1}}>
                 <Button
                   variant="contained"
-                  color="error"
-                  startIcon={<ClearAllIcon />}
-                  onClick={handleClearAll}
+                  onClick={() => setVisible(true)}
                   disabled={rows.length === 0}
                 >
-                  Clear All
+                  Generate Timeline
                 </Button>
-                <input
-                  type="file"
-                  ref={fileInputRef}
-                  style={{ display: 'none' }}
-                  accept=".csv"
-                  onChange={handleFileUpload}
-                />
+                <Button
+                  variant="contained"
+                  color="primary"
+                  startIcon={<FileDownloadIcon />}
+                  onClick={handleExportClick}
+                  disabled={!visible || rows.length === 0}
+                >
+                  Export
+                </Button>
+                <Menu
+                  anchorEl={anchorEl}
+                  open={Boolean(anchorEl)}
+                  onClose={handleExportClose}
+                >
+                  <MuiMenuItem onClick={handleExportPNG}>Export as PNG</MuiMenuItem>
+                  <MuiMenuItem onClick={handleExportPDF}>Export as PDF</MuiMenuItem>
+                  <MuiMenuItem onClick={handleExportCSV}>Export as CSV</MuiMenuItem>
+                </Menu>
               </Box>
-              <Button variant="contained" color="primary" startIcon={<SaveIcon />} onClick={handleSave}>
-                Save
-              </Button>
-            </Box>
-            <DataGrid
-              rows={rows}
-              columns={columns}
-              processRowUpdate={handleRowUpdate}
-              experimentalFeatures={{ newEditingApi: true }}
-            />
-          </Box>
-        </Collapse>
-      </Box>
 
-      <Box sx={{ display: 'flex', gap: 2, pt:8, pb:1}}>
-        <Button
-          variant="contained"
-          onClick={() => setVisible(true)}
-          disabled={rows.length === 0}
-        >
-          Generate Timeline
-        </Button>
-        <Button
-          variant="contained"
-          color="primary"
-          startIcon={<FileDownloadIcon />}
-          onClick={handleExportClick}
-          disabled={!visible || rows.length === 0}
-        >
-          Export
-        </Button>
-        <Menu
-          anchorEl={anchorEl}
-          open={Boolean(anchorEl)}
-          onClose={handleExportClose}
-        >
-          <MuiMenuItem onClick={handleExportPNG}>Export as PNG</MuiMenuItem>
-          <MuiMenuItem onClick={handleExportPDF}>Export as PDF</MuiMenuItem>
-          <MuiMenuItem onClick={handleExportCSV}>Export as CSV</MuiMenuItem>
-        </Menu>
-      </Box>
-
-<Box>
-{visible && (
-        <div ref={timelineRef} style={{ border: '1px solid #ddd', padding: '10px'}}>
-          <Timeline groups={groups} items={items} options={options} />
-        </div>
-      )}
-</Box>
-    
-      <Dialog open={openDialog} onClose={() => { setOpenDialog(false); setFormErrors({}); }}>
-        <DialogTitle>Add New Item</DialogTitle>
-        <DialogContent>
-          <TextField
-            select
-            label="Capability"
-            value={newRow.capability}
-            onChange={(e) => setNewRow({ ...newRow, capability: e.target.value })}
-            fullWidth
-            margin="normal"
-            error={!!formErrors.capability}
-            helperText={formErrors.capability}
-          >
-            {capabilities.map((option) => (
-              <MenuItem key={option.name} value={option.name}>
-                {option.name}
-              </MenuItem>
-            ))}
-          </TextField>
-          <TextField
-            label="Feature"
-            value={newRow.feature}
-            onChange={(e) => setNewRow({ ...newRow, feature: e.target.value })}
-            fullWidth
-            margin="normal"
-            error={!!formErrors.feature}
-            helperText={formErrors.feature}
-          />
-          <TextField
-            label="Start Date"
-            type="date"
-            value={newRow.startDate}
-            onChange={(e) => setNewRow({ ...newRow, startDate: e.target.value })}
-            fullWidth
-            margin="normal"
-            InputLabelProps={{ shrink: true }}
-            error={!!formErrors.dates}
-            helperText={formErrors.dates}
-          />
-          <TextField
-            label="End Date"
-            type="date"
-            value={newRow.endDate}
-            onChange={(e) => setNewRow({ ...newRow, endDate: e.target.value })}
-            fullWidth
-            margin="normal"
-            InputLabelProps={{ shrink: true }}
-            error={!!formErrors.dates}
-          />
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => { setOpenDialog(false); setFormErrors({}); }}>Cancel</Button>
-          <Button onClick={handleAddRow} variant="contained">Add</Button>
-        </DialogActions>
-      </Dialog>
-      <Dialog
-        open={clearDialogOpen}
-        onClose={() => setClearDialogOpen(false)}
-      >
-        <DialogTitle>Clear All Data?</DialogTitle>
-        <DialogContent>
-          Are you sure you want to clear all data? This action cannot be undone.
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setClearDialogOpen(false)}>Cancel</Button>
-          <Button onClick={handleConfirmClear} color="error" variant="contained">
-            Clear All
-          </Button>
-        </DialogActions>
-      </Dialog>
-    </div>
+              <Box>
+                {visible && (
+                  <div ref={timelineRef} style={{ border: '1px solid #ddd', padding: '10px'}}>
+                    <Timeline groups={groups} items={items} options={options} />
+                  </div>
+                )}
+              </Box>
+            
+              <Dialog open={openDialog} onClose={() => { setOpenDialog(false); setFormErrors({}); }}>
+                <DialogTitle>Add New Item</DialogTitle>
+                <DialogContent>
+                  <TextField
+                    select
+                    label="Capability"
+                    value={newRow.capability}
+                    onChange={(e) => setNewRow({ ...newRow, capability: e.target.value })}
+                    fullWidth
+                    margin="normal"
+                    error={!!formErrors.capability}
+                    helperText={formErrors.capability}
+                  >
+                    {capabilities.map((option) => (
+                      <MenuItem key={option.name} value={option.name}>
+                        {option.name}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                  <TextField
+                    label="Feature"
+                    value={newRow.feature}
+                    onChange={(e) => setNewRow({ ...newRow, feature: e.target.value })}
+                    fullWidth
+                    margin="normal"
+                    error={!!formErrors.feature}
+                    helperText={formErrors.feature}
+                  />
+                  <TextField
+                    label="Start Date"
+                    type="date"
+                    value={newRow.startDate}
+                    onChange={(e) => setNewRow({ ...newRow, startDate: e.target.value })}
+                    fullWidth
+                    margin="normal"
+                    InputLabelProps={{ shrink: true }}
+                    error={!!formErrors.dates}
+                    helperText={formErrors.dates}
+                  />
+                  <TextField
+                    label="End Date"
+                    type="date"
+                    value={newRow.endDate}
+                    onChange={(e) => setNewRow({ ...newRow, endDate: e.target.value })}
+                    fullWidth
+                    margin="normal"
+                    InputLabelProps={{ shrink: true }}
+                    error={!!formErrors.dates}
+                  />
+                </DialogContent>
+                <DialogActions>
+                  <Button onClick={() => { setOpenDialog(false); setFormErrors({}); }}>Cancel</Button>
+                  <Button onClick={handleAddRow} variant="contained">Add</Button>
+                </DialogActions>
+              </Dialog>
+              <Dialog
+                open={clearDialogOpen}
+                onClose={() => setClearDialogOpen(false)}
+              >
+                <DialogTitle>Clear All Data?</DialogTitle>
+                <DialogContent>
+                  Are you sure you want to clear all data? This action cannot be undone.
+                </DialogContent>
+                <DialogActions>
+                  <Button onClick={() => setClearDialogOpen(false)}>Cancel</Button>
+                  <Button onClick={handleConfirmClear} color="error" variant="contained">
+                    Clear All
+                  </Button>
+                </DialogActions>
+              </Dialog>
+            </>
+          } />
+        </Routes>
+      </div>
+    </Router>
   );
 }
 
