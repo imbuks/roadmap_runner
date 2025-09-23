@@ -2,23 +2,14 @@
   display: flex !important;
   align-items: center !important;
   justify-content: center !important;
+  text-align: center !important;
 }
 
-.vis-item .vis-item-content {
-  padding: 0 12px !important;
-  display: flex !important;
-  align-items: center !important;
-  justify-content: center !important;
-  font-size: 14px !important;
-  color: inherit !important;
-  overflow: hidden !important;
-  text-overflow: ellipsis !important;
-  white-space: nowrap !important;
-}
 .vis-timeline {
   border: 1px solid #E0E0E0;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
   background: #FFFFFF;
+  overflow-x: auto !important;
 }
 
 /* Group styling */
@@ -28,7 +19,7 @@
 }
 
 .vis-labelset {
-  width: 200px !important;
+  width: 250px !important;
 }
 
 .vis-group {
@@ -60,13 +51,6 @@
   border: none !important;
 }
 
-.vis-item .vis-item-content {
-  padding: 0 12px !important;
-  display: flex !important;
-  align-items: center !important;
-  justify-content: center !important;
-  font-size: 14px !important;
-}
 
 /* Grid lines */
 .vis-time-axis .vis-grid.vis-minor {
@@ -125,23 +109,11 @@
   border-bottom: 1px solid rgba(224, 224, 224, 0.3) !important;
 }
 
-.rotated-label {
-  transform: rotate(-90deg);
-  transform-origin: center;
-  position: absolute;
-  left: 40px;
-  width: 80px;
-  height: 30px;
-  line-height: 30px;
-  text-align: center;
-  white-space: nowrap;
-  font-weight: bold;
-  z-index: 1;
-}
+
 
 /* Ensure the timeline content area fills available space */
 .vis-content {
-  left: 200px !important; /* Match labelset width */
+  left: 250px !important; /* Match labelset width */
 }
 
 /* Remove any gaps between groups */
@@ -160,8 +132,8 @@
 }
 
 .vis-panel.vis-left {
-  width: 200px !important;
-  min-width: 200px !important;
+  width: 250px !important;
+  min-width: 250px !important;
   max-width: 220px !important;
   border-right: 1px solid #E0E0E0 !important;
 }
@@ -177,20 +149,6 @@
   border: none !important;
 }
 
-.vis-item .vis-item-content {
-  position: relative !important;
-  left: 0 !important;
-  width: calc(100% - 24px) !important;
-  padding: 0 12px !important;
-  text-align: center !important;
-  display: flex !important;
-  align-items: center !important;
-  justify-content: center !important;
-  overflow: hidden !important;
-  text-overflow: ellipsis !important;
-  white-space: nowrap !important;
-  font-weight: 500 !important;
-}
 
 /* Time axis styling */
 .vis-time-axis {
@@ -223,15 +181,15 @@
 
 /* Capability Labels Area (Left Panel) */
 .vis-panel.vis-left {
-  width: 200px !important;
-  min-width: 200px !important;
+  width: 250px !important;
+  min-width: 250px !important;
   max-width: 220px !important;
   border-right: 1px solid #E0E0E0 !important;
 }
 
 .vis-labelset .vis-label {
-  width: 200px !important;
-  min-width: 200px !important;
+  width: 250px !important;
+  min-width: 250px !important;
   max-width: 220px !important;
   font-size: 16px !important;
   font-weight: bold !important;
@@ -269,14 +227,32 @@
   margin: 5px 5px !important; 
   border: none !important; /* No border on the library's item div */
   padding: 0 !important; /* No padding on the library's item div */
-  /* Make this a flex container that stretches its child (our template's output) */
+  /* Make this a flex container that centers its child (our template's output) */
   display: flex !important; 
-  align-items: stretch !important;
-  justify-content: stretch !important;
-  overflow: hidden; /* Clip the content wrapper if it somehow tries to overflow */
+  align-items: center !important;
+  justify-content: center !important;
+  overflow: visible; /* Allow content to be visible for proper scrolling */
 }
 
 /* Feature Item Styling - INNER CONTENT WRAPPER (created by our itemTemplate) */
+.timeline-feature-item > * {
+  text-align: center !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* Ensure text content is centered */
+.timeline-feature-item .vis-item-content {
+  text-align: center !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 100% !important;
+  height: 100% !important;
+}
 
 
 /* Time Axis Styling */
@@ -453,14 +429,16 @@
 
 /* Rotate capability labels */
 .vis-label .vis-inner .vis-label-text {
-  transform: rotate(-90deg) !important;
-  transform-origin: center center !important;
+  transform: none !important;
+  writing-mode: horizontal-tb !important;
+  text-orientation: mixed !important;
   white-space: normal !important;
   word-break: break-word !important;
+  overflow-wrap: break-word !important;
   display: block !important;
   padding: 8px !important;
   text-align: center !important;
-  max-width: 80px !important;
+  max-width: 100% !important;
   line-height: 1.2 !important;
 }
 
@@ -471,8 +449,8 @@
 
 /* Remove rotation from capability labels */
 .vis-label .vis-label-content {
-  writing-mode: horizontal-tb !important;
-  text-orientation: mixed !important;
+  /* writing-mode: horizontal-tb !important; */
+  /* text-orientation: mixed !important; */
   padding: 0 !important;
   height: 100% !important;
   display: flex !important;
@@ -496,19 +474,6 @@
   background: inherit !important;
 }
 
-.vis-item .vis-item-content {
-  padding: 8px 16px !important;
-  font-size: 14px !important;
-  font-weight: 500 !important;
-  color: inherit !important;
-  white-space: normal !important;
-  word-break: break-word !important;
-  line-height: 1.2 !important;
-  display: flex !important;
-  align-items: center !important;
-  justify-content: center !important;
-  text-align: center !important;
-}
 
 /* Capability row backgrounds */
 .vis-group {
@@ -661,20 +626,6 @@
   background: inherit !important;
 }
 
-.vis-item .vis-item-content {
-  padding: 8px 16px !important;
-  font-size: 14px !important;
-  font-weight: 500 !important;
-  color: inherit !important;
-  white-space: normal !important;
-  word-break: break-word !important;
-  line-height: 1.2 !important;
-  display: flex !important;
-  align-items: center !important;
-  justify-content: center !important;
-  text-align: center !important;
-  font-weight: bold !important;
-}
 
 /* Capability row backgrounds */
 .vis-group {
@@ -722,13 +673,21 @@
 
 /* Fix text alignment in items */
 .vis-item .vis-item-content {
-  position: relative !important;
-  left: 0 !important;
-  width: 100% !important;
-  height: 100% !important;
+  transform: none !important;
+  writing-mode: horizontal-tb !important;
+  text-orientation: mixed !important;
+  white-space: normal !important;
+  word-break: break-word !important;
+  text-align: center !important;
   display: flex !important;
   align-items: center !important;
   justify-content: center !important;
+  padding: 8px 12px !important;
+  font-size: 14px !important;
+  line-height: 1.2 !important;
+  color: inherit !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
 }
 
 /* Remove box shadows from items */
@@ -739,4 +698,69 @@
 /* Ensure proper vertical alignment */
 .vis-content {
   align-items: center !important;
+}
+/* Final override: horizontal, wrapping capability labels */
+/* .rotated-label {
+  display: none !important;
+} */
+.vis-labelset .vis-label,
+.vis-label .vis-inner .vis-label-text,
+.vis-label .vis-label-content {
+  transform: none !important;
+  writing-mode: horizontal-tb !important;
+  text-orientation: mixed !important;
+  white-space: normal !important;
+  word-break: break-word !important;
+  overflow-wrap: break-word !important;
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  justify-content: center !important;
+  height: auto !important;
+  max-width: 250px !important;
+  padding: 4px 8px !important;
+}
+.rct-sidebar-row {
+  line-height: normal !important;
+}
+.rct-sidebar-row > div > div {
+  transform: none !important;
+  writing-mode: horizontal-tb !important;
+  text-orientation: mixed !important;
+  white-space: normal !important;
+  word-break: break-word !important;
+  overflow-wrap: break-word !important;
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  justify-content: center !important;
+  height: auto !important;
+  padding: 8px !important;
+}
+
+/* Fix react-calendar-timeline scrolling and item width issues */
+.react-calendar-timeline .rct-outer {
+  overflow-x: auto !important;
+  overflow-y: hidden !important;
+}
+
+.react-calendar-timeline .rct-scroll {
+  overflow-x: auto !important;
+}
+
+/* Ensure timeline items have minimum width and proper text display */
+.rct-item {
+  min-width: 60px !important;
+  white-space: nowrap !important;
+  overflow: visible !important;
+  text-overflow: clip !important;
+  font-size: 12px !important;
+}
+
+/* Fix item text container */
+.rct-item > div {
+  white-space: normal !important;
+  word-wrap: break-word !important;
+  min-width: 60px !important;
+  font-size: 12px !important;
 }

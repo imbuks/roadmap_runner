@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import Timeline from "./components/Timeline";
+import * as XLSX from 'xlsx';
 import { DataGrid, GridActionsCellItem } from '@mui/x-data-grid';
 import { 
   Button, 
@@ -14,7 +15,9 @@ import {
   MenuItem as MuiMenuItem,
   Collapse,
   Typography,
-  IconButton
+  IconButton,
+  AppBar,
+  Toolbar
 } from '@mui/material';
 import ColorLensIcon from '@mui/icons-material/ColorLens';
 import DeleteIcon from '@mui/icons-material/Delete';
@@ -24,28 +27,107 @@ import FileUploadIcon from '@mui/icons-material/FileUpload';
 import ClearAllIcon from '@mui/icons-material/ClearAll';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import ExpandLessIcon from '@mui/icons-material/ExpandLess';
+import MenuIcon from '@mui/icons-material/Menu';
 import moment from 'moment';
 import html2canvas from 'html2canvas';
 import jsPDF from 'jspdf';
 import "react-calendar-timeline/dist/style.css";
 import "./styles/Timeline.css";
+import { BrowserRouter as Router, Routes, Route, Link } from 'react-router-dom';
+import JiraStories from './components/JiraStories';
+
+function parseCsvDate(dateStr) {
+  // Expects DD/MM/YYYY, returns YYYY-MM-DD or empty string if invalid
+  if (!dateStr) return '';
+  // Ensure dateStr is a string
+  dateStr = String(dateStr).trim();
+  if (!dateStr) return '';
+
+  let parts;
+  if (dateStr.includes('/')) {
+    parts = dateStr.split('/');
+  } else if (dateStr.includes('-')) {
+    // Already in YYYY-MM-DD format
+    if (dateStr.match(/^\d{4}-\d{2}-\d{2}$/)) {
+      return dateStr;
+    }
+    parts = dateStr.split('-');
+  } else {
+    return '';
+  }
+
+  if (parts.length !== 3) return '';
+
+  let [d, m, y] = parts;
+
+  // Check if it's already in YYYY-MM-DD format
+  if (parts[0].length === 4) {
+    [y, m, d] = parts;
+  }
+
+  if (!d || !m || !y) return '';
+
+  // Pad day and month
+  const day = d.toString().padStart(2, '0');
+  const month = m.toString().padStart(2, '0');
+  const year = y.toString();
+
+  // Validate the date
+  const date = new Date(`${year}-${month}-${day}`);
+  if (isNaN(date.getTime())) return '';
+
+  const result = `${year}-${month}-${day}`;
+  console.log(`Parsed date: "${dateStr}" -> "${result}"`);
+  return result;
+}
+
+// Function to generate capabilities from existing data
+function generateCapabilitiesFromData(rows) {
+  const uniqueCapabilities = [...new Set(rows.map(row => row.capability).filter(Boolean))];
+  const colors = [
+    '#5D4C82', '#FFE0A0', '#E07A6C', '#6D4C41', '#7BA7D0', 
+    '#EA632B', '#F15C75', '#9C27B0', '#FF9800', '#4CAF50', 
+    '#2196F3', '#795548', '#607D8B', '#E91E63', '#3F51B5'
+  ];
+  
+  return uniqueCapabilities.map((name, index) => ({
+    name,
+    color: colors[index % colors.length]
+  }));
+}
 
 function App() {
   const timelineRef = useRef(null);
-  const fileInputRef = useRef(null);
+  const csvInputRef = useRef(null);
+  const excelInputRef = useRef(null);
   const [anchorEl, setAnchorEl] = useState(null);
+  const [navMenuAnchorEl, setNavMenuAnchorEl] = useState(null);
   const [visible, setVisible] = useState(false);
   const [rows, setRows] = useState([]);
+  const [applicationFilter, setApplicationFilter] = useState('All');
+  const [fundingFilter, setFundingFilter] = useState('All');
   const [openDialog, setOpenDialog] = useState(false);
   const [formErrors, setFormErrors] = useState({});
   const [newRow, setNewRow] = useState({
     capability: '',
     feature: '',
     startDate: '',
-    endDate: ''
+    endDate: '',
+    funding: ''
   });
   const [clearDialogOpen, setClearDialogOpen] = useState(false);
   const [tableExpanded, setTableExpanded] = useState(true);
+  const [csvHeaders, setCsvHeaders] = useState([]);
+  const [csvRowsRaw, setCsvRowsRaw] = useState([]);
+  const [mappingDialogOpen, setMappingDialogOpen] = useState(false);
+  const [columnMapping, setColumnMapping] = useState({ capability: '', feature: '', startDate: '', endDate: '', funding: '' });
+  const requiredFields = [
+    { key: 'capability', label: 'Capability' },
+    { key: 'feature', label: 'Feature' },
+    { key: 'startDate', label: 'Start Date' },
+    { key: 'endDate', label: 'End Date' },
+    { key: 'funding', label: 'Funding' }
+  ];
 
   // Load data from localStorage on component mount
   useEffect(() => {
@@ -54,6 +136,36 @@ function App() {
       setRows(JSON.parse(savedData));
     }
   }, []);
+
+  // Generate capabilities dynamically from data, with fallback to predefined ones
+  const predefinedCapabilities = [
+    { name: 'Immigration', color: '#5D4C82' },
+    { name: 'Briefing Pack Manager', color: '#FFE0A0' },
+    { name: 'Monitoring & Admin', color: '#E07A6C' },
+    { name: 'Briefing', color: '#6D4C41' },
+    { name: 'Roster', color: '#7BA7D0' },
+    { name: 'Duty Preparation', color: '#EA632B' },
+    { name: 'Pre-Flight (Day of Ops)', color: '#F15C75' },
+    { name: 'Post-Flight', color: '#9C27B0' },
+    { name: 'Communication & Engagement', color: '#FF9800' },
+    { name: 'Safety & Emergency', color: '#4CAF50' },
+    { name: 'Performance & HR', color: '#2196F3' }
+  ];
+
+  // Extract unique applications and funding sources for dropdowns
+  const applicationList = ['All', ...Array.from(new Set(rows.map(r => r.application).filter(app => app)))];
+  const fundingList = ['All', ...Array.from(new Set(rows.map(r => r.funding).filter(funding => funding)))];
+
+  // Filter rows by application and funding
+  let filteredRows = rows;
+  if (applicationFilter !== 'All') {
+    filteredRows = filteredRows.filter(r => r.application === applicationFilter);
+  }
+  if (fundingFilter !== 'All') {
+    filteredRows = filteredRows.filter(r => r.funding === fundingFilter);
+  }
+
+  const capabilities = filteredRows.length > 0 ? generateCapabilitiesFromData(filteredRows) : predefinedCapabilities;
 
   const handleSave = () => {
     localStorage.setItem('roadmapData', JSON.stringify(rows));
@@ -64,17 +176,6 @@ function App() {
     setRows(updatedRows);
     localStorage.setItem('roadmapData', JSON.stringify(updatedRows));
   };
-
-  // Predefined capabilities and their colors
-  const capabilities = [
-    { name: 'Roster', color: '#5D4C82' },
-    { name: 'Duty Preparation', color: '#FFE0A0' },
-    { name: 'Pre-Flight (Day of Ops)', color: '#E07A6C' },
-    { name: 'Post-Flight', color: '#6D4C41' },
-    { name: 'Communication & Engagement', color: '#7BA7D0' },
-    { name: 'Safety & Emegency', color: '#EA632B' },
-    { name: 'Performance & HR', color: '#F15C75' }
-  ];
 
   const getContrastingTextColor = (hexColor) => {
     if (!hexColor || hexColor.length < 7) return '#000000';
@@ -145,6 +246,7 @@ function App() {
     { field: 'feature', headerName: 'Feature', width: 250, editable: true },
     { field: 'startDate', headerName: 'Start Date', width: 130, editable: true, type: 'date', valueFormatter: (startDate) => { if (!startDate) return ''; return new Date(startDate).toLocaleDateString(); } },
     { field: 'endDate', headerName: 'End Date', width: 130, editable: true, type: 'date', valueFormatter: (endDate) => { if (!endDate) return ''; return new Date(endDate).toLocaleDateString(); } },
+    { field: 'funding', headerName: 'Funding', width: 120, editable: true },
     {
       field: 'color',
       headerName: 'Color',
@@ -183,7 +285,7 @@ function App() {
 
   // Map capabilities to groups for react-calendar-timeline
   const groups = capabilities
-    .filter(cap => rows.some(row => row.capability === cap.name))
+    .filter(cap => filteredRows.some(row => row.capability === cap.name))
     .map((cap, idx) => ({
       id: idx + 1,
       title: cap.name,
@@ -192,16 +294,26 @@ function App() {
     }));
 
   // Map features to items for react-calendar-timeline
-  const items = rows.map((row, idx) => {
+  const items = filteredRows.map((row, idx) => {
     const groupIdx = groups.findIndex(g => g.title === row.capability);
     if (groupIdx === -1) return null;
     const cap = capabilities.find(c => c.name === row.capability);
+    
+    const startDate = moment(row.startDate);
+    const endDate = moment(row.endDate);
+    
+    // Skip items with invalid dates or where end date is before start date
+    if (!startDate.isValid() || !endDate.isValid() || endDate.isBefore(startDate)) {
+      console.warn(`Invalid date range for item "${row.feature}": ${row.startDate} to ${row.endDate}`);
+      return null;
+    }
+    
     return {
       id: idx + 1,
       group: groups[groupIdx].id,
       title: row.feature,
-      start_time: moment(row.startDate),
-      end_time: moment(row.endDate),
+      start_time: startDate,
+      end_time: endDate,
       style: {
         background: cap.color,
         color: getContrastingTextColor(cap.color),
@@ -258,7 +370,7 @@ function App() {
     const updatedRows = [...rows, rowToAdd];
     setRows(updatedRows);
     localStorage.setItem('roadmapData', JSON.stringify(updatedRows));
-    setNewRow({ capability: '', feature: '', startDate: '', endDate: '' });
+    setNewRow({ capability: '', feature: '', startDate: '', endDate: '', funding: '' });
     setFormErrors({});
     setOpenDialog(false);
   };
@@ -269,6 +381,14 @@ function App() {
 
   const handleExportClose = () => {
     setAnchorEl(null);
+  };
+
+  const handleNavMenuClick = (event) => {
+    setNavMenuAnchorEl(event.currentTarget);
+  };
+
+  const handleNavMenuClose = () => {
+    setNavMenuAnchorEl(null);
   };
 
   const handleExportPNG = async () => {
@@ -334,43 +454,106 @@ function App() {
   };
 
   const handleImportClick = () => {
-    fileInputRef.current?.click();
+    // fileInputRef removed; use csvInputRef or excelInputRef instead
   };
 
-  const handleFileUpload = (event) => {
+  const handleCsvUpload = (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
-
+    if (!file.name.endsWith('.csv')) {
+      alert('Please upload a CSV file.');
+      event.target.value = '';
+      return;
+    }
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
         const text = e.target?.result;
         if (!text) return;
+        const lines = text.split('\n').filter(line => line.trim());
+        const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+        const dataRows = lines.slice(1).map(line => line.split(','));
 
-        const lines = text.split('\n');
-        const headers = lines[0].split(',');
-        const newRows = lines.slice(1)
-          .filter(line => line.trim())
-          .map((line, index) => {
-            const values = line.split(',');
-            const row = {};
-            headers.forEach((header, i) => {
-              row[header.trim()] = values[i]?.trim();
-            });
-            // Ensure ID is unique if not provided in CSV
-            row.id = row.id || Math.max(...rows.map(r => r.id), 0) + index + 1;
-            return row;
+        // Normalize each row and extract columns
+        const newRows = dataRows.map((values, idx) => {
+          // Build normalized row object
+          const rowObj = {};
+          headers.forEach((header, i) => {
+            rowObj[header] = (values[i] || '').trim();
           });
+          return {
+            capability: rowObj['capability'] || 'General',
+            feature: rowObj['feature'] || '',
+            application: rowObj['application'] || '',
+            startDate: parseCsvDate(rowObj['start date'] || rowObj['startdate'] || rowObj['start_date'] || ''),
+            endDate: parseCsvDate(rowObj['end date'] || rowObj['enddate'] || rowObj['end_date'] || ''),
+            id: idx + 1
+          };
+        }).filter(r => r.feature && (r.startDate || r.endDate));
 
         setRows(newRows);
         localStorage.setItem('roadmapData', JSON.stringify(newRows));
+        alert(`Successfully imported ${newRows.length} rows from CSV file.`);
       } catch (error) {
         console.error('Error parsing CSV:', error);
         alert('Error parsing CSV file. Please ensure the file is properly formatted.');
       }
     };
     reader.readAsText(file);
-    event.target.value = ''; // Reset file input
+    event.target.value = '';
+  };
+
+  const handleExcelUpload = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    if (!(file.name.endsWith('.xlsx') || file.name.endsWith('.xls'))) {
+      alert('Please upload an Excel file (.xlsx or .xls).');
+      event.target.value = '';
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const data = new Uint8Array(e.target.result);
+      const workbook = XLSX.read(data, { type: 'array' });
+      // Use 'master' sheet or first sheet if not found
+      const sheetName = workbook.SheetNames.find(n => n.toLowerCase().includes('master')) || workbook.SheetNames[0];
+      const sheet = workbook.Sheets[sheetName];
+      const json = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+      // Normalize column names and values
+      const normalize = obj => {
+        const out = {};
+        Object.keys(obj).forEach(key => {
+          let val = obj[key];
+          // Handle Excel date serials
+          if (typeof val === 'number' && key.toLowerCase().includes('date')) {
+            // Excel date serial to JS date
+            const jsDate = XLSX.SSF.parse_date_code(val);
+            if (jsDate) {
+              val = `${jsDate.y}-${String(jsDate.m).padStart(2,'0')}-${String(jsDate.d).padStart(2,'0')}`;
+            }
+          }
+          out[key.trim().toLowerCase()] = String(val).trim();
+        });
+        return out;
+      };
+      const normalizedRows = json.map(normalize);
+      // Debug popup removed
+      const newRows = normalizedRows.map((r, idx) => ({
+        capability: r.capability || 'General',
+        feature: r.feature || '',
+        application: r.application || '',
+        funding: r.funding || '',
+        startDate: parseCsvDate(r['start date'] || r['startdate'] || r.startdate || r['start_date'] || ''),
+        endDate: parseCsvDate(r['end date'] || r['enddate'] || r.enddate || r['end_date'] || ''),
+        id: idx + 1
+      })).filter(r => r.feature && (r.startDate || r.endDate));
+      // Debug popup removed
+      setRows(newRows);
+      localStorage.setItem('roadmapData', JSON.stringify(newRows));
+      alert(`Successfully imported ${newRows.length} rows from Excel file.`);
+    };
+    reader.readAsArrayBuffer(file);
+    event.target.value = '';
   };
 
   const handleClearAll = () => {
@@ -388,183 +571,319 @@ function App() {
     setTableExpanded(!tableExpanded);
   };
 
-  return (
-    <div style={{ padding: 20 }}>
-      <h1>Roadmap Runner</h1>
-    
-      <Box sx={{ width: '100%' }}>
-        <Box 
-          sx={{ 
-            display: 'flex', 
-            justifyContent: 'space-between', 
-            alignItems: 'center',
-            marginBottom: 2,
-            backgroundColor: '#f5f5f5',
-            padding: '8px 16px',
-            borderRadius: '4px'
-          }}
-          onClick={toggleTable}
-          style={{ cursor: 'pointer' }}
-        >
-          <Typography variant="h6" component="div">
-            Data Table
-          </Typography>
-          {tableExpanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
-        </Box>
+  const handleMappingImport = () => {
+    // Validate mapping
+    if (!columnMapping.capability || !columnMapping.feature || !columnMapping.startDate || !columnMapping.endDate) {
+      alert('Please map all required fields.');
+      return;
+    }
+    const newRows = csvRowsRaw.map((values, index) => {
+      const row = {
+        capability: values[csvHeaders.indexOf(columnMapping.capability)]?.trim() || '',
+        feature: values[csvHeaders.indexOf(columnMapping.feature)]?.trim() || '',
+        funding: values[csvHeaders.indexOf(columnMapping.funding)]?.trim() || '',
+        startDate: parseCsvDate(values[csvHeaders.indexOf(columnMapping.startDate)]?.trim() || ''),
+        endDate: parseCsvDate(values[csvHeaders.indexOf(columnMapping.endDate)]?.trim() || ''),
+      };
+      row.id = Math.max(...rows.map(r => r.id), 0) + index + 1;
+      return row;
+    });
+    setRows(newRows);
+    localStorage.setItem('roadmapData', JSON.stringify(newRows));
+    setMappingDialogOpen(false);
+  };
 
-        <Collapse in={tableExpanded}>
-          <Box sx={{ height: 400, width: '100%', marginBottom: 2 }}>
-            <Box sx={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
-              <Box sx={{ display: 'flex', gap: 2 }}>
-                <Button variant="contained" onClick={() => setOpenDialog(true)}>
-                  Add New Item
-                </Button>
-                <Button
-                  variant="contained"
-                  color="secondary"
-                  startIcon={<FileUploadIcon />}
-                  onClick={handleImportClick}
+  return (
+    <Router>
+      <Box sx={{ flexGrow: 1 }}>
+        <AppBar position="static">
+          <Toolbar>
+            <IconButton
+              size="large"
+              edge="start"
+              color="inherit"
+              aria-label="menu"
+              onClick={handleNavMenuClick}
+              sx={{ mr: 2 }}
+            >
+              <MenuIcon />
+            </IconButton>
+            <Typography variant="h6" component="div" sx={{ flexGrow: 1 }}>
+              Roadmap Runner
+            </Typography>
+            <Menu
+              anchorEl={navMenuAnchorEl}
+              open={Boolean(navMenuAnchorEl)}
+              onClose={handleNavMenuClose}
+            >
+              <MuiMenuItem component={Link} to="/" onClick={handleNavMenuClose}>
+                Roadmap Runner
+              </MuiMenuItem>
+              <MuiMenuItem component={Link} to="/jira-stories" onClick={handleNavMenuClose}>
+                Jira Stories
+              </MuiMenuItem>
+            </Menu>
+          </Toolbar>
+        </AppBar>
+      </Box>
+      <div style={{ padding: 20 }}>
+        <Routes>
+          <Route path="/jira-stories" element={<JiraStories />} />
+          <Route path="/" element={
+            <>
+              <Box sx={{ width: '100%' }}>
+                <Box 
+                  sx={{ 
+                    display: 'flex', 
+                    justifyContent: 'space-between', 
+                    alignItems: 'center',
+                    marginBottom: 2,
+                    backgroundColor: '#f5f5f5',
+                    padding: '8px 16px',
+                    borderRadius: '4px'
+                  }}
+                  onClick={toggleTable}
+                  style={{ cursor: 'pointer' }}
                 >
-                  Import CSV
-                </Button>
-                <Button
-                  variant="contained"
-                  color="error"
-                  startIcon={<ClearAllIcon />}
-                  onClick={handleClearAll}
-                  disabled={rows.length === 0}
-                >
-                  Clear All
-                </Button>
-                <input
-                  type="file"
-                  ref={fileInputRef}
-                  style={{ display: 'none' }}
-                  accept=".csv"
-                  onChange={handleFileUpload}
-                />
-              </Box>
+                  <Typography variant="h6" component="div">
+                    Data Table
+                  </Typography>
+                  {tableExpanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+                </Box>
+
+                <Collapse in={tableExpanded}>
+        <Box sx={{ height: 400, width: '100%', marginBottom: 2 }}>
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+            <Box sx={{ mb: 3, display: 'flex', gap: 2 }}>
+              <Button
+                variant="outlined"
+                startIcon={<FileUploadIcon />}
+                onClick={() => csvInputRef.current?.click()}
+              >
+                Upload CSV
+              </Button>
+              <input
+                type="file"
+                accept=".csv"
+                ref={csvInputRef}
+                style={{ display: 'none' }}
+                onChange={handleCsvUpload}
+              />
+              <Button
+                variant="outlined"
+                startIcon={<FileUploadIcon />}
+                onClick={() => excelInputRef.current?.click()}
+              >
+                Upload Excel
+              </Button>
+              <input
+                type="file"
+                accept=".xlsx,.xls"
+                ref={excelInputRef}
+                style={{ display: 'none' }}
+                onChange={handleExcelUpload}
+              />
+              <Button
+                variant="outlined"
+                startIcon={<ClearAllIcon />}
+                onClick={handleClearAll}
+              >
+                Clear All
+              </Button>
               <Button variant="contained" color="primary" startIcon={<SaveIcon />} onClick={handleSave}>
                 Save
               </Button>
             </Box>
-            <DataGrid
-              rows={rows}
-              columns={columns}
-              processRowUpdate={handleRowUpdate}
-              experimentalFeatures={{ newEditingApi: true }}
-            />
           </Box>
-        </Collapse>
-      </Box>
 
-      <Box sx={{ display: 'flex', gap: 2, pt:8, pb:1}}>
-        <Button
-          variant="contained"
-          onClick={() => setVisible(true)}
-          disabled={rows.length === 0}
-        >
-          Generate Timeline
-        </Button>
-        <Button
-          variant="contained"
-          color="primary"
-          startIcon={<FileDownloadIcon />}
-          onClick={handleExportClick}
-          disabled={!visible || rows.length === 0}
-        >
-          Export
-        </Button>
-        <Menu
-          anchorEl={anchorEl}
-          open={Boolean(anchorEl)}
-          onClose={handleExportClose}
-        >
-          <MuiMenuItem onClick={handleExportPNG}>Export as PNG</MuiMenuItem>
-          <MuiMenuItem onClick={handleExportPDF}>Export as PDF</MuiMenuItem>
-          <MuiMenuItem onClick={handleExportCSV}>Export as CSV</MuiMenuItem>
-        </Menu>
-      </Box>
+          {/* Filter Dropdowns - Only visible when data exists */}
+          {rows.length > 0 && (
+            <Box sx={{ mb: 2, display: 'flex', gap: 2, flexWrap: 'wrap' }}>
+              <TextField
+                select
+                label="Filter by Application"
+                value={applicationFilter}
+                onChange={e => setApplicationFilter(e.target.value)}
+                size="small"
+                sx={{ minWidth: 200 }}
+              >
+                {applicationList.map(app => (
+                  <MenuItem key={app} value={app}>{app}</MenuItem>
+                ))}
+              </TextField>
+              
+              <TextField
+                select
+                label="Filter by Funding"
+                value={fundingFilter}
+                onChange={e => setFundingFilter(e.target.value)}
+                size="small"
+                sx={{ minWidth: 200 }}
+              >
+                {fundingList.map(funding => (
+                  <MenuItem key={funding} value={funding}>{funding}</MenuItem>
+                ))}
+              </TextField>
+            </Box>
+          )}
 
-<Box>
-{visible && (
-        <div ref={timelineRef} style={{ border: '1px solid #ddd', padding: '10px'}}>
-          <Timeline groups={groups} items={items} options={options} />
-        </div>
-      )}
-</Box>
-    
-      <Dialog open={openDialog} onClose={() => { setOpenDialog(false); setFormErrors({}); }}>
-        <DialogTitle>Add New Item</DialogTitle>
-        <DialogContent>
-          <TextField
-            select
-            label="Capability"
-            value={newRow.capability}
-            onChange={(e) => setNewRow({ ...newRow, capability: e.target.value })}
-            fullWidth
-            margin="normal"
-            error={!!formErrors.capability}
-            helperText={formErrors.capability}
-          >
-            {capabilities.map((option) => (
-              <MenuItem key={option.name} value={option.name}>
-                {option.name}
-              </MenuItem>
-            ))}
-          </TextField>
-          <TextField
-            label="Feature"
-            value={newRow.feature}
-            onChange={(e) => setNewRow({ ...newRow, feature: e.target.value })}
-            fullWidth
-            margin="normal"
-            error={!!formErrors.feature}
-            helperText={formErrors.feature}
-          />
-          <TextField
-            label="Start Date"
-            type="date"
-            value={newRow.startDate}
-            onChange={(e) => setNewRow({ ...newRow, startDate: e.target.value })}
-            fullWidth
-            margin="normal"
-            InputLabelProps={{ shrink: true }}
-            error={!!formErrors.dates}
-            helperText={formErrors.dates}
-          />
-          <TextField
-            label="End Date"
-            type="date"
-            value={newRow.endDate}
-            onChange={(e) => setNewRow({ ...newRow, endDate: e.target.value })}
-            fullWidth
-            margin="normal"
-            InputLabelProps={{ shrink: true }}
-            error={!!formErrors.dates}
-          />
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => { setOpenDialog(false); setFormErrors({}); }}>Cancel</Button>
-          <Button onClick={handleAddRow} variant="contained">Add</Button>
-        </DialogActions>
-      </Dialog>
-      <Dialog
-        open={clearDialogOpen}
-        onClose={() => setClearDialogOpen(false)}
-      >
-        <DialogTitle>Clear All Data?</DialogTitle>
-        <DialogContent>
-          Are you sure you want to clear all data? This action cannot be undone.
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setClearDialogOpen(false)}>Cancel</Button>
-          <Button onClick={handleConfirmClear} color="error" variant="contained">
-            Clear All
-          </Button>
-        </DialogActions>
-      </Dialog>
-    </div>
+                    <DataGrid
+                      rows={filteredRows}
+                      columns={columns}
+                      processRowUpdate={handleRowUpdate}
+                      experimentalFeatures={{ newEditingApi: true }}
+                    />
+                  </Box>
+                </Collapse>
+              </Box>
+
+              <Box sx={{ display: 'flex', gap: 2, pt:8, pb:1}}>
+                <Button
+                  variant="contained"
+                  onClick={() => setVisible(true)}
+                  disabled={filteredRows.length === 0}
+                >
+                  Generate Timeline
+                </Button>
+                <Button
+                  variant="contained"
+                  color="primary"
+                  startIcon={<FileDownloadIcon />}
+                  onClick={handleExportClick}
+                  disabled={!visible || filteredRows.length === 0}
+                >
+                  Export
+                </Button>
+                <Menu
+                  anchorEl={anchorEl}
+                  open={Boolean(anchorEl)}
+                  onClose={handleExportClose}
+                >
+                  <MuiMenuItem onClick={handleExportPNG}>Export as PNG</MuiMenuItem>
+                  <MuiMenuItem onClick={handleExportPDF}>Export as PDF</MuiMenuItem>
+                  <MuiMenuItem onClick={handleExportCSV}>Export as CSV</MuiMenuItem>
+                </Menu>
+              </Box>
+
+              <Box>
+                {visible && (
+                  <div ref={timelineRef} style={{ border: '1px solid #ddd', padding: '10px', overflowX: 'auto', width: '100%' }}>
+                    <Timeline groups={groups} items={items} options={options} />
+                  </div>
+                )}
+              </Box>
+
+              <Dialog open={openDialog} onClose={() => { setOpenDialog(false); setFormErrors({}); }}>
+                <DialogTitle>Add New Item</DialogTitle>
+                <DialogContent>
+                  <TextField
+                    select
+                    label="Capability"
+                    value={newRow.capability}
+                    onChange={(e) => setNewRow({ ...newRow, capability: e.target.value })}
+                    fullWidth
+                    margin="normal"
+                    error={!!formErrors.capability}
+                    helperText={formErrors.capability}
+                  >
+                    {capabilities.map((option) => (
+                      <MenuItem key={option.name} value={option.name}>
+                        {option.name}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                  <TextField
+                    label="Feature"
+                    value={newRow.feature}
+                    onChange={(e) => setNewRow({ ...newRow, feature: e.target.value })}
+                    fullWidth
+                    margin="normal"
+                    error={!!formErrors.feature}
+                    helperText={formErrors.feature}
+                  />
+                  <TextField
+                    label="Start Date"
+                    type="date"
+                    value={newRow.startDate}
+                    onChange={(e) => setNewRow({ ...newRow, startDate: e.target.value })}
+                    fullWidth
+                    margin="normal"
+                    InputLabelProps={{ shrink: true }}
+                    error={!!formErrors.dates}
+                    helperText={formErrors.dates}
+                  />
+                  <TextField
+                    label="End Date"
+                    type="date"
+                    value={newRow.endDate}
+                    onChange={(e) => setNewRow({ ...newRow, endDate: e.target.value })}
+                    fullWidth
+                    margin="normal"
+                    InputLabelProps={{ shrink: true }}
+                    error={!!formErrors.dates}
+                  />
+                  <TextField
+                    label="Funding"
+                    value={newRow.funding}
+                    onChange={(e) => setNewRow({ ...newRow, funding: e.target.value })}
+                    fullWidth
+                    margin="normal"
+                    error={!!formErrors.funding}
+                    helperText={formErrors.funding}
+                  />
+                </DialogContent>
+                <DialogActions>
+                  <Button onClick={() => { setOpenDialog(false); setFormErrors({}); }}>Cancel</Button>
+                  <Button onClick={handleAddRow} variant="contained">Add</Button>
+                </DialogActions>
+              </Dialog>
+              <Dialog
+                open={clearDialogOpen}
+                onClose={() => setClearDialogOpen(false)}
+              >
+                <DialogTitle>Clear All Data?</DialogTitle>
+                <DialogContent>
+                  Are you sure you want to clear all data? This action cannot be undone.
+                </DialogContent>
+                <DialogActions>
+                  <Button onClick={() => setClearDialogOpen(false)}>Cancel</Button>
+                  <Button onClick={handleConfirmClear} color="error" variant="contained">
+                    Clear All
+                  </Button>
+                </DialogActions>
+              </Dialog>
+              <Dialog open={mappingDialogOpen} onClose={() => setMappingDialogOpen(false)}>
+                <DialogTitle>Map CSV Columns</DialogTitle>
+                <DialogContent>
+                  <Typography gutterBottom>
+                    Please map each required field to a column from your CSV file:
+                  </Typography>
+                  {requiredFields.map(field => (
+                    <TextField
+                      key={field.key}
+                      select
+                      label={field.label}
+                      value={columnMapping[field.key]}
+                      onChange={e => setColumnMapping({ ...columnMapping, [field.key]: e.target.value })}
+                      fullWidth
+                      margin="normal"
+                    >
+                      {csvHeaders.map(header => (
+                        <MenuItem key={header} value={header}>{header}</MenuItem>
+                      ))}
+                    </TextField>
+                  ))}
+                </DialogContent>
+                <DialogActions>
+                  <Button onClick={() => setMappingDialogOpen(false)}>Cancel</Button>
+                  <Button onClick={handleMappingImport} variant="contained">Import</Button>
+                </DialogActions>
+              </Dialog>
+            </>
+          } />
+        </Routes>
+      </div>
+    </Router>
   );
 }
 
