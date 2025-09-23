@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import Timeline from 'react-calendar-timeline';
 import 'react-calendar-timeline/dist/style.css';
+import '../styles/TimelineItemFix.css';
 import { Box, ButtonGroup, Button } from '@mui/material';
 
 // groups: [{ id, title, ... }]
@@ -70,8 +71,8 @@ export default function TimelineWrapper({ groups, items, options }) {
         canMove={false}
         canResize={false}
         stackItems
-        itemHeightRatio={0.6}
-        lineHeight={100}
+        itemHeightRatio={0.8}
+        lineHeight={120}
         sidebarWidth={130}
         headerLabelGroupHeight={40}
         headerLabelHeight={40}
@@ -79,25 +80,32 @@ export default function TimelineWrapper({ groups, items, options }) {
         maxZoom={ZOOM_LEVELS.ONE_YEAR}
         visibleTimeStart={options?.min?.valueOf()}
         visibleTimeEnd={options?.min?.valueOf() + zoom}
+        buffer={1}
         itemRenderer={({ item, getItemProps }) => (
           <div {...getItemProps({
             style: {
               ...item.style,
               borderRadius: 6,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
+              padding: '4px 6px',
+              fontSize: '12px',
               fontWeight: 500,
-              fontSize: 14,
-              padding: '0 16px',
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-              height: '100%',
-              cursor: 'default'
+              textAlign: 'center',
+              cursor: 'default',
+              minWidth: '60px',
+              width: 'auto'
             }
           })}>
-            {item.title}
+            <div style={{
+              lineHeight: '1.3',
+              whiteSpace: 'normal',
+              wordWrap: 'break-word',
+              overflowWrap: 'break-word',
+              display: 'block',
+              height: 'auto',
+              minWidth: '60px'
+            }}>
+              {item.title}
+            </div>
           </div>
         )}
         groupRenderer={({ group }) => (

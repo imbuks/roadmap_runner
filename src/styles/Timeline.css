@@ -2,12 +2,14 @@
   display: flex !important;
   align-items: center !important;
   justify-content: center !important;
+  text-align: center !important;
 }
 
 .vis-timeline {
   border: 1px solid #E0E0E0;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
   background: #FFFFFF;
+  overflow-x: auto !important;
 }
 
 /* Group styling */
@@ -225,14 +227,32 @@
   margin: 5px 5px !important; 
   border: none !important; /* No border on the library's item div */
   padding: 0 !important; /* No padding on the library's item div */
-  /* Make this a flex container that stretches its child (our template's output) */
+  /* Make this a flex container that centers its child (our template's output) */
   display: flex !important; 
-  align-items: stretch !important;
-  justify-content: stretch !important;
-  overflow: hidden; /* Clip the content wrapper if it somehow tries to overflow */
+  align-items: center !important;
+  justify-content: center !important;
+  overflow: visible; /* Allow content to be visible for proper scrolling */
 }
 
 /* Feature Item Styling - INNER CONTENT WRAPPER (created by our itemTemplate) */
+.timeline-feature-item > * {
+  text-align: center !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* Ensure text content is centered */
+.timeline-feature-item .vis-item-content {
+  text-align: center !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 100% !important;
+  height: 100% !important;
+}
 
 
 /* Time Axis Styling */
@@ -716,4 +736,31 @@
   justify-content: center !important;
   height: auto !important;
   padding: 8px !important;
+}
+
+/* Fix react-calendar-timeline scrolling and item width issues */
+.react-calendar-timeline .rct-outer {
+  overflow-x: auto !important;
+  overflow-y: hidden !important;
+}
+
+.react-calendar-timeline .rct-scroll {
+  overflow-x: auto !important;
+}
+
+/* Ensure timeline items have minimum width and proper text display */
+.rct-item {
+  min-width: 60px !important;
+  white-space: nowrap !important;
+  overflow: visible !important;
+  text-overflow: clip !important;
+  font-size: 12px !important;
+}
+
+/* Fix item text container */
+.rct-item > div {
+  white-space: normal !important;
+  word-wrap: break-word !important;
+  min-width: 60px !important;
+  font-size: 12px !important;
 }

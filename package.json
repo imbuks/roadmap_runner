@@ -21,6 +21,7 @@
     "react-router-dom": "^7.6.2",
     "react-scripts": "^5.0.0",
     "tough-cookie": "^4.1.4",
+    "uuid": "^11.1.0",
     "vis-data": "^7.1.9",
     "vis-timeline": "^7.7.4",
     "xlsx": "^0.18.5"
