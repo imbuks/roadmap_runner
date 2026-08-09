@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import Timeline from "./components/Timeline";
+import JiraAuthAvatar from "./components/JiraAuthAvatar";
 import * as XLSX from 'xlsx';
 import { DataGrid, GridActionsCellItem } from '@mui/x-data-grid';
 import { 
@@ -33,8 +34,9 @@ import html2canvas from 'html2canvas';
 import jsPDF from 'jspdf';
 import "react-calendar-timeline/dist/style.css";
 import "./styles/Timeline.css";
-import { BrowserRouter as Router, Routes, Route, Link } from 'react-router-dom';
-import JiraStories from './components/JiraStories';
+import { BrowserRouter as Router, Routes, Route, Link, Navigate, useLocation } from 'react-router-dom';
+import JiraMinator from './components/JiraMinator';
+import PIPlanner from './components/PIPlanner';
 
 function parseCsvDate(dateStr) {
   // Expects DD/MM/YYYY, returns YYYY-MM-DD or empty string if invalid
@@ -96,12 +98,60 @@ function generateCapabilitiesFromData(rows) {
   }));
 }
 
+// The bar shows the current page's name, so pages do not need their own heading block.
+// `accent` is the tail of the label tinted differently, keeping the JiraMinator wordmark.
+const PAGE_TITLES = [
+  { path: '/jiraminator', label: 'JiraMinator', accent: 'Minator' },
+  { path: '/jira-stories', label: 'JiraMinator', accent: 'Minator' },
+  { path: '/pi-planner', label: 'PI Planner' }
+];
+const HOME_TITLE = { path: '/', label: 'Roadmap Runner' };
+
+// Split out so it can read the active route, which needs to happen inside the Router
+function AppHeader() {
+  const [navMenuAnchorEl, setNavMenuAnchorEl] = useState(null);
+  const { pathname } = useLocation();
+  const page = PAGE_TITLES.find(p => pathname.startsWith(p.path)) || HOME_TITLE;
+  const closeMenu = () => setNavMenuAnchorEl(null);
+
+  return (
+    <AppBar position="sticky" color="primary">
+      <Toolbar>
+        <IconButton
+          size="large"
+          edge="start"
+          color="inherit"
+          aria-label="menu"
+          onClick={(e) => setNavMenuAnchorEl(e.currentTarget)}
+          sx={{ mr: 1.5 }}
+        >
+          <MenuIcon />
+        </IconButton>
+        <Typography variant="h6" component="div" sx={{ flexGrow: 1, fontWeight: 700 }}>
+          {page.accent ? (
+            <>
+              {page.label.slice(0, page.label.length - page.accent.length)}
+              <Box component="span" sx={{ color: 'rgba(255, 255, 255, 0.68)' }}>{page.accent}</Box>
+            </>
+          ) : page.label}
+        </Typography>
+        <Menu anchorEl={navMenuAnchorEl} open={Boolean(navMenuAnchorEl)} onClose={closeMenu}>
+          <MuiMenuItem component={Link} to="/" onClick={closeMenu}>Roadmap Runner</MuiMenuItem>
+          <MuiMenuItem component={Link} to="/jiraminator" onClick={closeMenu}>JiraMinator</MuiMenuItem>
+          <MuiMenuItem component={Link} to="/pi-planner" onClick={closeMenu}>PI Planner</MuiMenuItem>
+        </Menu>
+        {/* Jira connection state and sign-in live here rather than on each page */}
+        <JiraAuthAvatar />
+      </Toolbar>
+    </AppBar>
+  );
+}
+
 function App() {
   const timelineRef = useRef(null);
   const csvInputRef = useRef(null);
   const excelInputRef = useRef(null);
   const [anchorEl, setAnchorEl] = useState(null);
-  const [navMenuAnchorEl, setNavMenuAnchorEl] = useState(null);
   const [visible, setVisible] = useState(false);
   const [rows, setRows] = useState([]);
   const [applicationFilter, setApplicationFilter] = useState('All');
@@ -383,14 +433,6 @@ function App() {
     setAnchorEl(null);
   };
 
-  const handleNavMenuClick = (event) => {
-    setNavMenuAnchorEl(event.currentTarget);
-  };
-
-  const handleNavMenuClose = () => {
-    setNavMenuAnchorEl(null);
-  };
-
   const handleExportPNG = async () => {
     if (timelineRef.current) {
       try {
@@ -595,40 +637,13 @@ function App() {
 
   return (
     <Router>
-      <Box sx={{ flexGrow: 1 }}>
-        <AppBar position="static">
-          <Toolbar>
-            <IconButton
-              size="large"
-              edge="start"
-              color="inherit"
-              aria-label="menu"
-              onClick={handleNavMenuClick}
-              sx={{ mr: 2 }}
-            >
-              <MenuIcon />
-            </IconButton>
-            <Typography variant="h6" component="div" sx={{ flexGrow: 1 }}>
-              Roadmap Runner
-            </Typography>
-            <Menu
-              anchorEl={navMenuAnchorEl}
-              open={Boolean(navMenuAnchorEl)}
-              onClose={handleNavMenuClose}
-            >
-              <MuiMenuItem component={Link} to="/" onClick={handleNavMenuClose}>
-                Roadmap Runner
-              </MuiMenuItem>
-              <MuiMenuItem component={Link} to="/jira-stories" onClick={handleNavMenuClose}>
-                Jira Stories
-              </MuiMenuItem>
-            </Menu>
-          </Toolbar>
-        </AppBar>
-      </Box>
+      <AppHeader />
       <div style={{ padding: 20 }}>
         <Routes>
-          <Route path="/jira-stories" element={<JiraStories />} />
+          <Route path="/jiraminator" element={<JiraMinator />} />
+          {/* Keep old bookmarks working after the rename */}
+          <Route path="/jira-stories" element={<Navigate to="/jiraminator" replace />} />
+          <Route path="/pi-planner" element={<PIPlanner />} />
           <Route path="/" element={
             <>
               <Box sx={{ width: '100%' }}>
