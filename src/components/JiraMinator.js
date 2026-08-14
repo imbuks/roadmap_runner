@@ -33,14 +33,17 @@ import {
   FilterList as FilterListIcon,
   ArrowUpward as ArrowUpwardIcon,
   ArrowDownward as ArrowDownwardIcon,
-  Difference as DifferenceIcon
+  Difference as DifferenceIcon,
+  Fullscreen as FullscreenIcon,
+  FullscreenExit as FullscreenExitIcon
 } from '@mui/icons-material';
 import Divider from '@mui/material/Divider';
-import MDEditor from '@uiw/react-md-editor';
+import MDEditor, { commands as mdCommands } from '@uiw/react-md-editor';
 import '@uiw/react-md-editor/markdown-editor.css';
 import '@uiw/react-markdown-preview/markdown.css';
 import useJiraAuth, { jiraAuthService } from '../hooks/useJiraAuth';
 import { markdownToJira } from '../utils/markdownToJira';
+import { jiraToMarkdown } from '../utils/jiraToMarkdown';
 
 // Column visibility and order are remembered across sessions
 const COLUMN_VISIBILITY_KEY = 'jiraMinatorColumnVisibility';
@@ -331,6 +334,11 @@ export default function JiraMinator() {
   // Below md the two dialog columns stack, so go full screen instead of a tall floating panel
   const theme = useTheme();
   const compactDialog = useMediaQuery(theme.breakpoints.down('md'));
+  // Manual full screen for the create/edit dialog, on top of the automatic compact one
+  const [dialogFullScreen, setDialogFullScreen] = useState(false);
+  // Wiki markup has no editor of its own, so it borrows MDEditor's edit/live/preview
+  // modes: 'edit' is the textarea alone, 'live' splits it with the rendered preview
+  const [wikiPreviewMode, setWikiPreviewMode] = useState('edit');
 
   // The description editors need a pixel height, so measure the space the flex layout gives them
   const editorAreaRef = useRef(null);
@@ -504,7 +512,10 @@ export default function JiraMinator() {
       setEpicSearching(true);
       jiraAuthService.apiCall('search-epics', {
         query: q,
-        projectKey: selectedProject ? selectedProject.key : undefined
+        projectKey: selectedProject ? selectedProject.key : undefined,
+        // Matches the project list: finished epics are not offered, though an exact
+        // key still resolves so a known epic can be pasted in regardless
+        openOnly: true
       })
         .then(data => setEpicSearchResults(data.epics || []))
         .catch(err => {
@@ -1401,11 +1412,12 @@ export default function JiraMinator() {
     }
   }, [columnOrder]);
 
-  // Fetch epics for selected project
+  // Fetch epics for selected project. Finished epics are left out — nothing new should
+  // be linked to one — but the row's own epic is still offered, see epicOptions below.
   useEffect(() => {
     if (jiraSessionId && selectedProject) {
       setEpicsForProjectLoading(true);
-      jiraAuthService.apiCall('epics', { projectKey: selectedProject.key })
+      jiraAuthService.apiCall('epics', { projectKey: selectedProject.key, openOnly: true })
         .then(data => setEpicsForProject(data.epics || []))
         .catch(err => {
           console.error('Failed to fetch epics:', err.message);
@@ -1812,12 +1824,13 @@ export default function JiraMinator() {
   ];
 
   // The project's epics plus anything the search turned up, deduped by key. The row's own
-  // epic is added too so a value from another project still displays after reopening.
+  // epic is added too, so a value the lists do not carry — another project's epic, or one
+  // that has since been closed — still displays after reopening.
   const epicOptions = (() => {
     const byKey = new Map();
     [...epicsForProject, ...epicSearchResults].forEach(e => { if (e && e.id) byKey.set(e.id, e); });
     if (newRow.epicLink && !byKey.has(newRow.epicLink)) {
-      byKey.set(newRow.epicLink, { id: newRow.epicLink, title: '(not in this project)', project: '', foreign: true });
+      byKey.set(newRow.epicLink, { id: newRow.epicLink, title: '(current link)', project: '', foreign: true });
     }
     return [...byKey.values()];
   })();
@@ -2461,8 +2474,8 @@ export default function JiraMinator() {
         onClose={() => { setOpenDialog(false); setJiraCurrentDescription(null); }}
         maxWidth="lg"
         fullWidth
-        fullScreen={compactDialog}
-        slotProps={{ paper: { sx: compactDialog ? undefined : { height: '88vh' } } }}
+        fullScreen={compactDialog || dialogFullScreen}
+        slotProps={{ paper: { sx: (compactDialog || dialogFullScreen) ? undefined : { height: '88vh' } } }}
       >
         <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 1.5 }}>
           <Box sx={{ flex: 1 }}>
@@ -2472,6 +2485,14 @@ export default function JiraMinator() {
           </Box>
           {selectedProject && <Chip size="small" color="primary" label={selectedProject.key} />}
           {selectedBoard && <Chip size="small" variant="outlined" label={selectedBoard.name} />}
+          {/* Below md the dialog is already full screen, so the toggle would do nothing */}
+          {!compactDialog && (
+            <Tooltip title={dialogFullScreen ? 'Exit full screen' : 'Full screen'}>
+              <IconButton size="small" onClick={() => setDialogFullScreen(v => !v)}>
+                {dialogFullScreen ? <FullscreenExitIcon /> : <FullscreenIcon />}
+              </IconButton>
+            </Tooltip>
+          )}
         </DialogTitle>
         <DialogContent dividers sx={{ p: 0, overflow: 'hidden', display: 'flex', flexDirection: compactDialog ? 'column' : 'row' }}>
 
@@ -2505,7 +2526,7 @@ export default function JiraMinator() {
             </Box>
 
             <Box sx={{ flex: 1, minHeight: 240, display: 'flex', flexDirection: 'column' }}>
-              <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1.5, mb: 1 }}>
+              <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1.5, mb: 2.5 }}>
                 <TextField
                   select
                   size="small"
@@ -2550,29 +2571,65 @@ export default function JiraMinator() {
               </Box>
               {newRow.descriptionFormat === 'jira' && (
                 // Enough room below the buttons for the field's floating label to clear them
-                <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, mb: 1.75 }}>
+                <Box sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 0.5, mb: 3 }}>
                   {WIKI_TOOLBAR.map(btn => (
                     <Button
                       key={btn.label}
                       size="small"
                       variant="outlined"
                       onClick={btn.apply}
+                      // With the textarea hidden there is no selection to wrap
+                      disabled={wikiPreviewMode === 'preview'}
                       sx={{ minWidth: 0, px: 1, textTransform: 'none' }}
                     >
                       {btn.label}
                     </Button>
                   ))}
+                  {/* The same edit / live / preview control MDEditor shows for Markdown,
+                      down to its icons, so both description formats look alike */}
+                  <ToggleButtonGroup
+                    exclusive
+                    size="small"
+                    color="primary"
+                    value={wikiPreviewMode}
+                    onChange={(e, value) => value && setWikiPreviewMode(value)}
+                    // The icons carry a hard-coded 12px size, so scale them here
+                    sx={{ ml: 'auto', '& svg': { width: 14, height: 14 } }}
+                  >
+                    {[
+                      { value: 'edit', title: 'Write only', icon: mdCommands.codeEdit.icon },
+                      { value: 'live', title: 'Write and preview side by side', icon: mdCommands.codeLive.icon },
+                      { value: 'preview', title: 'Preview only', icon: mdCommands.codePreview.icon }
+                    ].map(mode => (
+                      <Tooltip key={mode.value} title={mode.title}>
+                        <ToggleButton value={mode.value} sx={{ px: 1, py: 0.5, lineHeight: 0 }}>
+                          {mode.icon}
+                        </ToggleButton>
+                      </Tooltip>
+                    ))}
+                  </ToggleButtonGroup>
                 </Box>
               )}
               {/* The Markdown editors have no built-in label, unlike the wiki TextField */}
               {newRow.descriptionFormat !== 'jira' && (
-                <Typography variant="caption" color="text.secondary" sx={{ mb: 0.5 }}>
+                <Typography variant="caption" color="text.secondary" sx={{ mt: 1, mb: 0.5 }}>
                   Description
                 </Typography>
               )}
               {/* Measured so the editor fills whatever height the dialog leaves it */}
-              <Box ref={editorAreaRef} sx={{ flex: 1, minHeight: 160, overflow: 'hidden' }}>
-                {newRow.descriptionFormat === 'jira' ? (
+              <Box
+                ref={editorAreaRef}
+                sx={{
+                  flex: 1,
+                  minHeight: 160,
+                  overflow: 'hidden',
+                  display: 'flex',
+                  // Side by side, unless the dialog is already stacking its columns
+                  flexDirection: compactDialog ? 'column' : 'row',
+                  gap: 1.5
+                }}
+              >
+                {newRow.descriptionFormat === 'jira' ? (wikiPreviewMode !== 'preview' && (
                   <TextField
                     label="Description"
                     value={newRow.description}
@@ -2584,19 +2641,50 @@ export default function JiraMinator() {
                     // Stretch the textarea to the measured area instead of guessing a row count,
                     // so it never overflows the container and gets clipped
                     sx={{
+                      flex: 1,
+                      minWidth: 0,
                       height: '100%',
                       '& .MuiInputBase-root': { height: '100%', alignItems: 'flex-start' },
                       '& .MuiInputBase-inputMultiline': { height: '100% !important', overflow: 'auto !important' }
                     }}
                   />
-                ) : (
-                  <MDEditor
-                    value={newRow.description}
-                    onChange={(value) => setNewRow({ ...newRow, description: value || '' })}
-                    preview={newRow.descriptionFormat === 'markdown' ? 'edit' : 'live'}
-                    height={editorHeight}
+                )) : (
+                  <Box sx={{ flex: 1, minWidth: 0 }}>
+                    <MDEditor
+                      value={newRow.description}
+                      onChange={(value) => setNewRow({ ...newRow, description: value || '' })}
+                      preview={newRow.descriptionFormat === 'markdown' ? 'edit' : 'live'}
+                      height={editorHeight}
+                      data-color-mode="light"
+                    />
+                  </Box>
+                )}
+                {/* Wiki markup has no live renderer of its own, so convert to Markdown
+                    and reuse the renderer the other formats already use */}
+                {newRow.descriptionFormat === 'jira' && wikiPreviewMode !== 'edit' && (
+                  <Box
                     data-color-mode="light"
-                  />
+                    sx={{
+                      flex: 1,
+                      minWidth: 0,
+                      overflow: 'auto',
+                      p: 1.5,
+                      border: 1,
+                      borderColor: 'divider',
+                      borderRadius: 1,
+                      bgcolor: 'background.paper'
+                    }}
+                  >
+                    <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
+                      Preview — approximate; Jira renders the markup itself
+                    </Typography>
+                    {newRow.description
+                      ? <MDEditor.Markdown
+                          source={jiraToMarkdown(newRow.description)}
+                          style={{ backgroundColor: 'transparent' }}
+                        />
+                      : <Typography variant="body2" color="text.disabled">Nothing to preview yet.</Typography>}
+                  </Box>
                 )}
               </Box>
               <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5 }}>

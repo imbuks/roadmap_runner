@@ -1,0 +1,21 @@
+# Installed inside the image from the lockfile, and a macOS node_modules would not run
+# on Linux anyway
+node_modules
+build
+
+.git
+.gitignore
+.github
+.claude
+.vscode
+.idea
+
+# Never bake credentials into an image layer
+.env
+.env.*
+
+npm-debug.log*
+yarn-error.log*
+*.log
+.DS_Store
+coverage

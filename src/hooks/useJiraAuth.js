@@ -8,10 +8,17 @@ const JIRA_AUTH_METHOD_KEY = 'jiraAuthMethod';
 // Supported authentication methods
 export const AUTH_METHODS = {
   BASIC: 'basic', // username + password/token (legacy)
-  PAT: 'pat'      // Personal Access Token (Jira Data Center/Server, Bearer auth)
+  PAT: 'pat',     // Personal Access Token (Jira Data Center/Server, Bearer auth)
+  SSO: 'sso'      // browser sign-in, for a Jira behind a gateway that demands interactive SSO
 };
 
 const DEFAULT_AUTH_METHOD = AUTH_METHODS.BASIC;
+
+// Where the Jira proxy lives. `npm start` runs the UI on 3000 and the proxy on 4000, so
+// that is the default. The Docker image builds with REACT_APP_API_BASE set to an empty
+// string: there the proxy serves this bundle itself, and a relative path keeps the calls
+// on whatever host and port the container was published on.
+const API_BASE = process.env.REACT_APP_API_BASE ?? 'http://localhost:4000';
 
 // Create a global event emitter for cross-component communication
 class JiraAuthEventEmitter {
@@ -95,7 +102,7 @@ export const jiraAuthService = {
 
   // Authenticate with Jira
   authenticate: async (jiraUrl, jiraUser, jiraToken, authType = DEFAULT_AUTH_METHOD) => {
-    const response = await fetch('http://localhost:4000/api/jira/auth', {
+    const response = await fetch(`${API_BASE}/api/jira/auth`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ jiraUrl, jiraUser, jiraToken, authType })
@@ -115,13 +122,40 @@ export const jiraAuthService = {
     return sessionId;
   },
 
+  // Sign in by having the server open a browser for the gateway's SSO flow. It resolves
+  // only once the user has been all the way through the identity provider (and any MFA),
+  // so there is deliberately no timeout here.
+  //
+  // An optional Personal Access Token is passed through because the gateway and Jira
+  // authenticate separately: the browser satisfies the gateway, and the token satisfies
+  // Jira, so supplying one skips Jira's own login page.
+  authenticateWithBrowser: async (jiraUrl, jiraToken) => {
+    const response = await fetch(`${API_BASE}/api/jira/sso-login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jiraUrl, jiraToken })
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || 'Browser sign-in failed');
+    }
+
+    const { sessionId, user } = await response.json();
+    jiraAuthService.storeSession(sessionId);
+    // Only the target is remembered here; the token itself stays server-side
+    jiraAuthService.storeCredentials({ jiraUrl, authType: AUTH_METHODS.SSO });
+
+    return { sessionId, user };
+  },
+
   // Sign out. The server keeps the session (and the token behind it) on disk so it
   // survives restarts, so ask it to forget the session before clearing local state.
   logout: async () => {
     const sessionId = jiraAuthService.getStoredSession();
     if (sessionId) {
       try {
-        await fetch('http://localhost:4000/api/jira/logout', {
+        await fetch(`${API_BASE}/api/jira/logout`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ sessionId })
@@ -139,7 +173,7 @@ export const jiraAuthService = {
     if (!sessionId) return false;
     
     try {
-      const response = await fetch('http://localhost:4000/api/jira/projects', {
+      const response = await fetch(`${API_BASE}/api/jira/projects`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionId })
@@ -161,7 +195,7 @@ export const jiraAuthService = {
 
   // Fetch projects
   fetchProjects: async (sessionId) => {
-    const response = await fetch('http://localhost:4000/api/jira/projects', {
+    const response = await fetch(`${API_BASE}/api/jira/projects`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionId })
@@ -187,7 +221,7 @@ export const jiraAuthService = {
       throw new Error('No active Jira session. Please authenticate first.');
     }
 
-    const response = await fetch(`http://localhost:4000/api/jira/${endpoint}`, {
+    const response = await fetch(`${API_BASE}/api/jira/${endpoint}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionId, ...data })
@@ -218,7 +252,7 @@ export const jiraAuthService = {
     files.forEach(file => formData.append('files', file, file.name));
 
     // Content-Type is intentionally omitted so the browser sets the multipart boundary
-    const response = await fetch('http://localhost:4000/api/jira/attach', {
+    const response = await fetch(`${API_BASE}/api/jira/attach`, {
       method: 'POST',
       body: formData
     });
@@ -305,6 +339,22 @@ export const useJiraAuth = () => {
     }
   }, []);
 
+  const authenticateWithBrowser = useCallback(async (jiraUrl, jiraToken) => {
+    setAuthLoading(true);
+    setAuthError('');
+
+    try {
+      return await jiraAuthService.authenticateWithBrowser(jiraUrl, jiraToken);
+    } catch (error) {
+      setAuthError(error.message);
+      setIsAuthenticated(false);
+      setSessionId(null);
+      throw error;
+    } finally {
+      setAuthLoading(false);
+    }
+  }, []);
+
   const logout = useCallback(async () => {
     await jiraAuthService.logout();
     setSessionId(null);
@@ -350,6 +400,7 @@ export const useJiraAuth = () => {
     authError,
     authLoading,
     authenticate,
+    authenticateWithBrowser,
     logout,
     apiCall,
     // Convenience methods

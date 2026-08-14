@@ -14,7 +14,10 @@ import {
   Chip,
   Divider
 } from '@mui/material';
-import { CheckCircle as CheckCircleIcon } from '@mui/icons-material';
+import {
+  CheckCircle as CheckCircleIcon,
+  OpenInBrowser as OpenInBrowserIcon
+} from '@mui/icons-material';
 import useJiraAuth, { AUTH_METHODS } from '../hooks/useJiraAuth';
 
 /**
@@ -28,6 +31,7 @@ export default function JiraAuth({ onAuthSuccess, onAuthFailure }) {
     authError,
     authLoading,
     authenticate,
+    authenticateWithBrowser,
     logout,
     getStoredCredentials,
     getDefaultAuthMethod,
@@ -45,6 +49,8 @@ export default function JiraAuth({ onAuthSuccess, onAuthFailure }) {
   const [makeDefault, setMakeDefault] = useState(false);
   const [defaultMethod, setDefaultMethodState] = useState(getDefaultAuthMethod());
   const [localError, setLocalError] = useState('');
+  // Tracked separately from authLoading so only the browser button shows its own progress
+  const [browserSignIn, setBrowserSignIn] = useState(false);
 
   // Load stored credentials (and preferred method) on component mount
   useEffect(() => {
@@ -55,8 +61,9 @@ export default function JiraAuth({ onAuthSuccess, onAuthFailure }) {
       jiraUrl: storedCreds?.jiraUrl || 'https://jiraagile.emirates.com',
       jiraUser: storedCreds?.jiraUser || ''
     }));
-    // Start on the last-used method if present, else the saved default
-    if (storedCreds?.authType) {
+    // Start on the last-used method if present, else the saved default. Browser sign-in
+    // is not one of the toggle options, so it must not be restored into the selector.
+    if (storedCreds?.authType && storedCreds.authType !== AUTH_METHODS.SSO) {
       setAuthMethod(storedCreds.authType);
     }
   }, [getStoredCredentials]);
@@ -114,6 +121,36 @@ export default function JiraAuth({ onAuthSuccess, onAuthFailure }) {
       if (onAuthFailure) {
         onAuthFailure(error);
       }
+    }
+  };
+
+  // Browser sign-in: the server opens a window, the user completes SSO there, and the
+  // resulting session is captured. No credentials are typed into this form at all.
+  const handleBrowserSignIn = async () => {
+    const { jiraUrl, pat } = formData;
+    if (!jiraUrl?.trim()) {
+      setLocalError('Please provide the Jira URL');
+      return;
+    }
+
+    try {
+      setLocalError('');
+      setBrowserSignIn(true);
+      // A token is optional here, but supplying one means Jira never asks you to log in
+      // a second time — the browser only has to satisfy the gateway.
+      const { sessionId: newSessionId } = await authenticateWithBrowser(jiraUrl.trim(), pat?.trim() || undefined);
+
+      if (onAuthSuccess) {
+        onAuthSuccess(newSessionId);
+      }
+    } catch (error) {
+      setLocalError(error.message || 'Browser sign-in failed');
+
+      if (onAuthFailure) {
+        onAuthFailure(error);
+      }
+    } finally {
+      setBrowserSignIn(false);
     }
   };
 
@@ -247,11 +284,34 @@ export default function JiraAuth({ onAuthSuccess, onAuthFailure }) {
       <Button
         variant="contained"
         onClick={handleAuthenticate}
-        disabled={authLoading}
-        startIcon={authLoading ? <CircularProgress size={20} /> : null}
+        disabled={authLoading || browserSignIn}
+        startIcon={authLoading && !browserSignIn ? <CircularProgress size={20} /> : null}
       >
-        {authLoading ? 'Authenticating...' : 'Authenticate'}
+        {authLoading && !browserSignIn ? 'Authenticating...' : 'Authenticate'}
       </Button>
+
+      {/* For a Jira published through a gateway that insists on interactive SSO, no token
+          can get through — the sign-in has to happen in a real browser. */}
+      <Divider>
+        <Typography variant="caption" color="text.secondary">or</Typography>
+      </Divider>
+
+      <Button
+        variant="outlined"
+        onClick={handleBrowserSignIn}
+        disabled={authLoading || browserSignIn}
+        startIcon={browserSignIn ? <CircularProgress size={20} /> : <OpenInBrowserIcon />}
+      >
+        {browserSignIn ? 'Waiting for browser sign-in...' : 'Sign in with browser'}
+      </Button>
+
+      <Typography variant="caption" color="text.secondary">
+        {browserSignIn
+          ? 'A browser window has opened. Complete the sign-in there — including any MFA prompt — and it will close by itself.'
+          : isPat && formData.pat?.trim()
+            ? 'Opens a browser for your SSO gateway. Your token above will be used for Jira itself, so you will not be asked to log in to Jira a second time.'
+            : 'Use this when your Jira sits behind a corporate SSO gateway. Opens a browser window. Tip: fill in a Personal Access Token above and you will only have to sign in once, to your organisation — Jira will not ask again.'}
+      </Typography>
     </Box>
   );
 }
