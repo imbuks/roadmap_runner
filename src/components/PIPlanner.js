@@ -33,6 +33,7 @@ import {
 } from '@mui/icons-material';
 import * as XLSX from 'xlsx';
 import useJiraAuth, { jiraAuthService } from '../hooks/useJiraAuth';
+import { debug } from '../utils/debug';
 
 function TabPanel(props) {
   const { children, value, index, ...other } = props;
@@ -241,14 +242,14 @@ export default function PIPlanner() {
   // Debug function to inspect complete Epic payload
   const debugEpicPayload = async (epicKey) => {
     try {
-      console.log(`Debugging Epic payload for: ${epicKey}`);
+      debug(`Debugging Epic payload for: ${epicKey}`);
       const response = await jiraAuthService.apiCall('debug-epic', { epicKey });
-      console.log('Complete Epic payload:', response.epic);
-      console.log('All custom fields:');
+      debug('Complete Epic payload:', response.epic);
+      debug('All custom fields:');
       Object.keys(response.epic.fields).forEach(fieldKey => {
         if (fieldKey.startsWith('customfield_')) {
           const value = response.epic.fields[fieldKey];
-          console.log(`${fieldKey}:`, value);
+          debug(`${fieldKey}:`, value);
         }
       });
       return response.epic;
@@ -263,9 +264,9 @@ export default function PIPlanner() {
   }, []);
 
   const importFromJira = async () => {
-    console.log('Import function called');
-    console.log('jiraSessionId:', jiraSessionId);
-    console.log('selectedEpicProjects:', selectedEpicProjects);
+    debug('Import function called');
+    debug('jiraSessionId:', jiraSessionId);
+    debug('selectedEpicProjects:', selectedEpicProjects);
     
     if (!jiraSessionId) {
       console.warn('Please authenticate with Jira first');
@@ -279,7 +280,7 @@ export default function PIPlanner() {
       return;
     }
     
-    console.log('Starting Epic-centric import...');
+    debug('Starting Epic-centric import...');
     setJiraLoading(true);
     try {
       let allFeatures = [];
@@ -297,11 +298,11 @@ export default function PIPlanner() {
           : [{ name: 'all', id: 'all', projectKey: project.key }];
         
         for (const version of versionsToProcess) {
-          console.log(`Fetching Epics for project ${project.key}, version ${version.name}`, version);
+          debug(`Fetching Epics for project ${project.key}, version ${version.name}`, version);
           
           // Fetch Epics for this project/version
           try {
-            console.log('About to call epics API with:', { 
+            debug('About to call epics API with:', { 
               projectKey: project.key,
               versionId: version.id
             });
@@ -311,16 +312,16 @@ export default function PIPlanner() {
               versionId: version.id  // Use actual selected version instead of 'all'
             });
             
-            console.log('Raw epics API response:', epicsData);
+            debug('Raw epics API response:', epicsData);
             const epics = epicsData.epics || [];
-            console.log(`Found ${epics.length} epics in ${project.key}/${version.name}`);
+            debug(`Found ${epics.length} epics in ${project.key}/${version.name}`);
             
             // STEP 2: For each Epic, fetch its parent Feature (if any) and its Stories
             for (const epic of epics) {
-              console.log('Processing epic:', epic);
-              console.log('Epic feature field:', epic.feature);
+              debug('Processing epic:', epic);
+              debug('Epic feature field:', epic.feature);
               const epicId = `${project.key}-${epic.id}`;
-              console.log('Epic ID for tracking:', epicId);
+              debug('Epic ID for tracking:', epicId);
               
               // Add epic to collection (avoid duplicates)
               if (!processedEpics.has(epicId)) {
@@ -328,28 +329,28 @@ export default function PIPlanner() {
                 allEpics.push(epic);
                 
                 // STEP 2A: Fetch parent Feature for this Epic (if it has an Epic Link/parent)
-                console.log('Epic feature field value:', epic.feature, 'Type:', typeof epic.feature);
+                debug('Epic feature field value:', epic.feature, 'Type:', typeof epic.feature);
                 if (epic.feature && typeof epic.feature === 'string' && epic.feature.trim()) {
                   const featureKey = epic.feature.trim();
                   // Use the actual feature key for tracking (don't add project prefix if it's already there)
                   const featureId = featureKey.includes('-') ? featureKey : `${project.key}-${featureKey}`;
-                  console.log(`Epic ${epic.id}: Attempting to fetch parent feature with key:`, featureKey, 'Using featureId for tracking:', featureId);
+                  debug(`Epic ${epic.id}: Attempting to fetch parent feature with key:`, featureKey, 'Using featureId for tracking:', featureId);
                   
                   if (!processedFeatures.has(featureId)) {
                     processedFeatures.add(featureId);
                     try {
                       // Fetch the parent Feature/Initiative (don't pass projectKey since we're fetching by specific key)
-                      console.log('Calling features API with issueKey:', featureKey);
+                      debug('Calling features API with issueKey:', featureKey);
                       const featureData = await jiraAuthService.apiCall('features', { 
                         issueKey: featureKey // Pass only specific issue key to get the parent from any project
                       });
                       
-                      console.log('Feature API response for', featureKey, ':', featureData);
+                      debug('Feature API response for', featureKey, ':', featureData);
                       if (featureData.features && featureData.features.length > 0) {
                         allFeatures.push(...featureData.features);
-                        console.log(`✅ Found parent feature ${featureKey} for epic ${epic.id}:`, featureData.features[0]);
+                        debug(`✅ Found parent feature ${featureKey} for epic ${epic.id}:`, featureData.features[0]);
                       } else {
-                        console.log(`❌ No features found for key ${featureKey}`);
+                        debug(`❌ No features found for key ${featureKey}`);
                       }
                     } catch (error) {
                       console.warn(`Failed to fetch parent feature ${featureKey} for epic ${epic.id}:`, error);
@@ -357,9 +358,9 @@ export default function PIPlanner() {
                   }
                 } else {
                   if (epic.feature) {
-                    console.log(`⚠️ Epic ${epic.id} has non-string feature field:`, epic.feature, 'Type:', typeof epic.feature);
+                    debug(`⚠️ Epic ${epic.id} has non-string feature field:`, epic.feature, 'Type:', typeof epic.feature);
                   } else {
-                    console.log(`ℹ️ Epic ${epic.id} has no parent feature (feature field is empty)`);
+                    debug(`ℹ️ Epic ${epic.id} has no parent feature (feature field is empty)`);
                   }
                 }
                 
@@ -372,7 +373,7 @@ export default function PIPlanner() {
                   });
                   const stories = storiesData.stories || [];
                   allStories.push(...stories);
-                  console.log(`Found ${stories.length} stories for epic ${epic.id}`);
+                  debug(`Found ${stories.length} stories for epic ${epic.id}`);
                 } catch (error) {
                   console.warn(`Failed to fetch stories for epic ${epic.id}:`, error);
                 }
@@ -384,7 +385,7 @@ export default function PIPlanner() {
         }
       }
 
-      console.log(`Epic-centric import completed: ${allEpics.length} epics, ${allFeatures.length} features, ${allStories.length} stories`);
+      debug(`Epic-centric import completed: ${allEpics.length} epics, ${allFeatures.length} features, ${allStories.length} stories`);
 
       // Smart merge: avoid duplicates based on ID
       const mergeData = (existingData, newData) => {
@@ -949,7 +950,7 @@ export default function PIPlanner() {
               startIcon={<RefreshIcon />}
               onClick={() => {
                 if (selectedEpicProjects.length > 0) {
-                  console.log('Refreshing data for projects:', selectedEpicProjects.map(p => p.key).join(', '), 'versions:', selectedEpicVersions.map(v => v.name).join(', '));
+                  debug('Refreshing data for projects:', selectedEpicProjects.map(p => p.key).join(', '), 'versions:', selectedEpicVersions.map(v => v.name).join(', '));
                   importFromJira();
                 }
               }}

@@ -15,6 +15,12 @@ const { loginWithBrowser } = require('./browser-login');
 const app = express();
 const PORT = process.env.PORT || 4000;
 
+// Per-request tracing — the JQL sent, the fields that came back — is what you want when
+// a custom field or a filter is misbehaving, and pure noise every other day. Warnings and
+// the session lifecycle stay on always; this is only the chatter. Set DEBUG=1 to see it.
+const DEBUG = /^(1|true|yes|on)$/i.test(process.env.DEBUG || '');
+const debug = DEBUG ? (...args) => console.log(...args) : () => {};
+
 // Attachments are held in memory only long enough to forward them to Jira
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
 
@@ -906,7 +912,7 @@ app.post('/api/jira/features', async (req, res) => {
         `project = "${projectKey}" AND (type = Feature OR type = Initiative)${versionClause} ORDER BY key DESC`,
         `project = "${projectKey}" AND type = Feature${versionClause} ORDER BY key DESC`
       ];
-    console.log(`Features endpoint - JQL: ${jqlCandidates[0]}`);
+    debug(`Features endpoint - JQL: ${jqlCandidates[0]}`);
 
     // Paged: the search API returns 50 by default, which silently truncated large
     // portfolio projects
@@ -944,7 +950,7 @@ app.post('/api/jira/debug-epic', async (req, res) => {
   const fetchWithCookies = makeJiraFetch(jar, jiraUrl, auth);
   try {
     const issueUrl = `${jiraUrl}/rest/api/2/issue/${epicKey}`;
-    console.log(`Debug endpoint - Fetching complete Epic payload for: ${epicKey}`);
+    debug(`Debug endpoint - Fetching complete Epic payload for: ${epicKey}`);
     
     const response = await fetchWithCookies(issueUrl, {
       headers: {
@@ -960,7 +966,7 @@ app.post('/api/jira/debug-epic', async (req, res) => {
     const data = JSON.parse(rawText);
     
     // Return the complete payload for debugging
-    console.log('Complete Epic payload fields:', Object.keys(data.fields));
+    debug('Complete Epic payload fields:', Object.keys(data.fields));
     res.json({ epic: data });
   } catch (err) {
     res.status(500).json({ error: err.message, stack: err.stack });
@@ -1023,16 +1029,16 @@ app.post('/api/jira/epics', async (req, res) => {
     
     if (versionId && versionId !== 'all') {
       jql += ` AND fixVersion = "${versionId}"`;
-      console.log(`Epic endpoint - Added version filter for: ${versionId}`);
+      debug(`Epic endpoint - Added version filter for: ${versionId}`);
     } else {
-      console.log('Epic endpoint - No version filter applied (versionId is "all" or empty)');
+      debug('Epic endpoint - No version filter applied (versionId is "all" or empty)');
     }
 
     if (openOnly) {
       jql += ` AND ${await openIssuesClause(fetchWithCookies, jiraUrl, buildAuthHeader(auth))}`;
     }
 
-    console.log(`Epic endpoint - Final JQL: ${jql}`);
+    debug(`Epic endpoint - Final JQL: ${jql}`);
     
     const searchUrl = `${jiraUrl}/rest/api/2/search?jql=${encodeURIComponent(jql)}&fields=key,summary,status,assignee,fixVersions,priority,description,created,updated,customfield_10014,issuetype,customfield_15502`;
     const response = await fetchWithCookies(searchUrl, {
@@ -1048,12 +1054,12 @@ app.post('/api/jira/epics', async (req, res) => {
     }
     const data = JSON.parse(rawText);
     
-    console.log(`Epic endpoint - Found ${data.issues.length} epics for project ${projectKey}, version ${versionId}`);
+    debug(`Epic endpoint - Found ${data.issues.length} epics for project ${projectKey}, version ${versionId}`);
     
     // Debug the first epic's custom field values
     if (data.issues.length > 0) {
       const firstEpic = data.issues[0];
-      console.log('First epic sample:', {
+      debug('First epic sample:', {
         key: firstEpic.key,
         summary: firstEpic.fields?.summary,
         issueType: firstEpic.fields?.issuetype?.name,
@@ -1063,7 +1069,7 @@ app.post('/api/jira/epics', async (req, res) => {
     
     const epics = data.issues.map(issue => {
       const featureValue = issue.fields.customfield_15502;
-      console.log(`Epic ${issue.key} - customfield_15502 value:`, featureValue, 'Type:', typeof featureValue);
+      debug(`Epic ${issue.key} - customfield_15502 value:`, featureValue, 'Type:', typeof featureValue);
       
       return {
         id: issue.key,

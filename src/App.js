@@ -37,6 +37,7 @@ import "./styles/Timeline.css";
 import { BrowserRouter as Router, Routes, Route, Link, Navigate, useLocation } from 'react-router-dom';
 import JiraMinator from './components/JiraMinator';
 import PIPlanner from './components/PIPlanner';
+import { debug } from './utils/debug';
 
 function parseCsvDate(dateStr) {
   // Expects DD/MM/YYYY, returns YYYY-MM-DD or empty string if invalid
@@ -79,7 +80,7 @@ function parseCsvDate(dateStr) {
   if (isNaN(date.getTime())) return '';
 
   const result = `${year}-${month}-${day}`;
-  console.log(`Parsed date: "${dateStr}" -> "${result}"`);
+  debug(`Parsed date: "${dateStr}" -> "${result}"`);
   return result;
 }
 

@@ -88,14 +88,32 @@ are, delete `browser-profile/`.
 One container serves the UI, the Jira proxy, and the sign-in browser:
 
 ```
-docker compose up --build
+docker compose up -d --build
 ```
+
+`-d` detaches, so the container keeps running after you close the terminal and comes back
+by itself when Docker restarts (`restart: unless-stopped`). Drop `-d` only when you want the
+log in the foreground; `--build` is needed the first time and after any code change.
 
 Then open [http://localhost:4000](http://localhost:4000) — a single port this time, because
 the server serves the built bundle itself rather than the two-port dev split.
 
 The first build takes several minutes and produces a large image: it installs Chromium,
 which browser sign-in cannot do without.
+
+Once detached, the container is managed from outside:
+
+| Command | What it does |
+| --- | --- |
+| `docker compose logs -f` | Follow the log (`Ctrl-C` leaves the container running) |
+| `docker compose ps` | Check it is up |
+| `docker compose restart` | Restart without rebuilding |
+| `docker compose stop` | Stop it, keeping the container and its volumes |
+| `docker compose down` | Stop and remove it; the session and profile volumes survive |
+| `docker compose up -d --build` | Rebuild and replace it after a code change |
+
+Nothing is lost on a restart: sessions live in the mounted `~/.roadmap-runner`, so a
+detached container that is stopped and started again picks the Jira session back up.
 
 ### Signing in from inside a container
 
@@ -130,6 +148,30 @@ Two environment variables are worth knowing about, beyond the keepalive ones abo
 `SERVE_UI=1` is what makes the server serve `build/` (off by default, so `npm run server`
 alongside the dev server never answers with a stale bundle), and `REACT_APP_API_BASE`
 is baked in empty at image build time so API calls stay same-origin.
+
+## Turning the noise up
+
+By default the log carries only what you would want to see on a normal day: sign-ins,
+session expiry, warnings, and errors. The per-request tracing — the JQL actually sent, the
+custom-field values that came back — is what you need when Jira returns something in an
+unexpected shape, and is off until you ask for it.
+
+Server side, in Docker or natively:
+
+```
+DEBUG=1 docker compose up -d
+DEBUG=1 npm run server
+```
+
+The browser console has its own switch, because by then the bundle is already built and a
+build-time flag would be no use against a running container. In devtools:
+
+```js
+localStorage.debug = '1'        // reload to trace the import epic by epic
+localStorage.removeItem('debug')  // back to quiet
+```
+
+For a dev session, `REACT_APP_DEBUG=1 npm start` does the same thing at build time.
 
 ## Excel Format
 

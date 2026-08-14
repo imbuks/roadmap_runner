@@ -1,7 +1,7 @@
 # Local deployment: one container running the UI, the Jira proxy, and a viewable browser
 # for the SSO sign-in.
 #
-#   docker compose up --build      start it (first build pulls Chromium, so it is slow)
+#   docker compose up -d --build   start it detached (first build pulls Chromium, so it is slow)
 #   docker compose logs -f         watch the proxy
 #   docker compose down            stop it
 services:
@@ -25,6 +25,9 @@ services:
       # Both optional; empty falls back to the defaults (5 min / 2 h)
       JIRA_KEEPALIVE_MS: "${JIRA_KEEPALIVE_MS:-}"
       JIRA_KEEPALIVE_MAX_IDLE_MS: "${JIRA_KEEPALIVE_MAX_IDLE_MS:-}"
+      # DEBUG=1 turns on per-request tracing (the JQL sent, the fields that came back).
+      # Off by default so the log stays down to sign-ins, warnings, and errors.
+      DEBUG: "${DEBUG:-}"
     # Chromium outgrows Docker's 64MB default and starts crashing on heavier pages
     shm_size: "1gb"
     restart: unless-stopped
