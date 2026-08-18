@@ -320,25 +320,18 @@ export default function JiraAuth({ onAuthSuccess, onAuthFailure }) {
         {browserSignIn ? 'Waiting for browser sign-in...' : 'Sign in with browser'}
       </Button>
 
-      {/* The window is on a screen the user cannot see, so hand them the way in. An
-          instruction to "complete the sign-in in the window that opened" is worse than
-          useless when no window ever appears on their desk. */}
+      {/* Running in a container the window opens on a screen the user cannot see, so
+          nothing appears on their desk. This is the way in. */}
       {browserSignIn && signInViewer && (
-        <Alert severity="info" icon={<OpenInBrowserIcon fontSize="inherit" />}>
-          The sign-in window is running on the server, so nothing opens on your desktop.
-          {' '}
-          <Link href={signInViewer} target="_blank" rel="noopener noreferrer">
-            Open it here
-          </Link>
-          {' '}and complete the sign-in — including any MFA prompt.
-        </Alert>
+        <Typography variant="caption" color="text.secondary">
+          <Link href={signInViewer} target="_blank" rel="noopener noreferrer">Click here</Link>
+          {' '}if the window does not open.
+        </Typography>
       )}
 
       <Typography variant="caption" color="text.secondary">
         {browserSignIn
-          ? signInViewer
-            ? 'This finishes on its own once the sign-in lands on Jira.'
-            : 'A browser window has opened. Complete the sign-in there — including any MFA prompt — and it will close by itself.'
+          ? 'A browser window has opened. Complete the sign-in there — including any MFA prompt — and it will close by itself.'
           : isPat && formData.pat?.trim()
             ? 'Opens a browser for your SSO gateway. Your token above will be used for Jira itself, so you will not be asked to log in to Jira a second time.'
             : 'Use this when your Jira sits behind a corporate SSO gateway. Opens a browser window. Tip: fill in a Personal Access Token above and you will only have to sign in once, to your organisation — Jira will not ask again.'}
