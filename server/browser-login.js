@@ -51,12 +51,58 @@ function requirePlaywright() {
   }
 }
 
+/*
+ * Chromium marks a profile as in use with a SingletonLock symlink pointing at
+ * "<hostname>-<pid>", and refuses to open a profile whose holder it cannot account for.
+ * A browser that dies without closing — the container stopped, the machine lost power —
+ * leaves that lock behind, and in Docker the profile sits on a volume that outlives the
+ * container, so the lock names a host that no longer exists. Every later sign-in is then
+ * turned away on behalf of a machine that has been gone for days.
+ *
+ * Only clear a lock that is provably dead: one from a different host, or one naming a pid
+ * on this host that is no longer running. A live local holder means a sign-in window is
+ * genuinely open, and refusing the second one is the correct answer — two browsers writing
+ * the same profile is what the lock exists to prevent.
+ */
+function clearStaleProfileLock(profileDir) {
+  let holder;
+  try {
+    holder = fs.readlinkSync(path.join(profileDir, 'SingletonLock'));
+  } catch (err) {
+    return; // no lock at all, or not a symlink: nothing to reason about
+  }
+  // Greedy host capture, because hostnames contain dashes and the pid is the last field
+  const match = /^(.*)-(\d+)$/.exec(holder);
+  if (!match) return; // an unfamiliar shape is not ours to second-guess
+  const [, host, pid] = match;
+
+  if (host === os.hostname()) {
+    try {
+      process.kill(Number(pid), 0); // signal 0 only tests for existence
+      return; // alive: a sign-in really is in progress
+    } catch (err) {
+      // ESRCH is the dead pid we are looking for; EPERM means it lives but belongs to
+      // another user, which is still a reason to leave the lock alone.
+      if (err.code !== 'ESRCH') return;
+    }
+  }
+
+  for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+    try {
+      fs.unlinkSync(path.join(profileDir, name));
+    } catch (err) {
+      // Already gone, which is the state we wanted anyway
+    }
+  }
+}
+
 // A visible browser with a profile that persists between sign-ins.
 async function launchSignInBrowser() {
   const { chromium } = requirePlaywright();
   fs.mkdirSync(PROFILE_DIR, { recursive: true, mode: 0o700 });
   // mkdirSync only applies its mode when it creates the directory, so tighten explicitly
   fs.chmodSync(PROFILE_DIR, 0o700);
+  clearStaleProfileLock(PROFILE_DIR);
   const context = await chromium.launchPersistentContext(PROFILE_DIR, {
     headless: false,
     // Mirrors this server's TLS posture, so a corporate interception certificate does
@@ -195,6 +241,7 @@ async function loginWithBrowser(jiraUrl, jar, { timeoutMs = SSO_LOGIN_TIMEOUT_MS
 
 module.exports = {
   loginWithBrowser,
+  clearStaleProfileLock,
   copyCookieToJar,
   GATEWAY_COOKIE_RE,
   SSO_LOGIN_TIMEOUT_MS,
