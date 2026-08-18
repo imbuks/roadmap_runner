@@ -184,15 +184,15 @@ async function probeIdentity(context, jiraUrl, authHeader) {
 }
 
 /**
- * Open a browser at the Jira URL, wait for the user to complete SSO, and seed `jar` with
- * the cookies that result. Resolves with { user, cookies }; rejects if the user closes
- * the window or the timeout elapses first.
+ * Open a browser at the Jira URL and wait for the user to complete SSO. Resolves with
+ * { user, captured } — the cookies exactly as the browser holds them — and rejects if the
+ * user closes the window or the timeout elapses first.
  *
  * `launch` exists so tests can supply a browser they also drive; it returns
  * { context, dispose }. In normal use it is a visible Chromium with a persistent profile,
  * because the whole point is that a human interacts with it.
  */
-async function loginWithBrowser(jiraUrl, jar, { timeoutMs = SSO_LOGIN_TIMEOUT_MS, launch, onProgress, authHeader } = {}) {
+async function runBrowserLogin(jiraUrl, { timeoutMs = SSO_LOGIN_TIMEOUT_MS, launch, onProgress, authHeader } = {}) {
   const report = onProgress || (() => {});
   const origin = new URL(jiraUrl).origin;
   const { context, dispose } = await (launch || launchSignInBrowser)();
@@ -223,12 +223,7 @@ async function loginWithBrowser(jiraUrl, jar, { timeoutMs = SSO_LOGIN_TIMEOUT_MS
         const me = (authHeader && await probeIdentity(context, jiraUrl, authHeader))
           || await probeIdentity(context, jiraUrl);
         if (me) {
-          const captured = await context.cookies();
-          for (const cookie of captured) await copyCookieToJar(jar, cookie);
-          return {
-            user: me.displayName || me.name,
-            cookies: captured.filter(c => GATEWAY_COOKIE_RE.test(c.name)).map(c => c.name)
-          };
+          return { user: me.displayName || me.name, captured: await context.cookies() };
         }
       }
       await new Promise(resolve => setTimeout(resolve, 1000));
@@ -237,6 +232,57 @@ async function loginWithBrowser(jiraUrl, jar, { timeoutMs = SSO_LOGIN_TIMEOUT_MS
   } finally {
     await Promise.resolve(dispose()).catch(() => {});
   }
+}
+
+/*
+ * One sign-in window at a time.
+ *
+ * The profile can only be open in one browser, so a second sign-in started while the first
+ * window is still up cannot succeed: Chromium hands the request to the instance already
+ * running and Playwright reports the profile as in use. This is easy to reach without doing
+ * anything wrong — a sign-in blocks for as long as the identity provider takes, several
+ * minutes with MFA, and both the sign-in button and any request that finds the gateway
+ * session lapsed will ask for one.
+ *
+ * So a second caller joins the window that is already open instead of fighting it. The
+ * cookies belong to the browser rather than to whoever asked first, so they seed every jar
+ * waiting on that window, and each caller ends up with the session it came for.
+ */
+let signInInFlight = null; // { origin, promise } while a window is open
+
+// Cookies belong to the browser, so hand the same capture to every jar waiting on it.
+async function seedJar(jar, captured) {
+  for (const cookie of captured) await copyCookieToJar(jar, cookie);
+  return captured.filter(c => GATEWAY_COOKIE_RE.test(c.name)).map(c => c.name);
+}
+
+/**
+ * Sign in through a browser and seed `jar` with the resulting cookies. Resolves with
+ * { user, cookies }; rejects if the user closes the window or the timeout elapses.
+ */
+async function loginWithBrowser(jiraUrl, jar, options = {}) {
+  const origin = new URL(jiraUrl).origin;
+
+  if (signInInFlight) {
+    // Two Jiras at once is not something one browser window can answer, and silently
+    // handing back another site's session would be worse than saying so.
+    if (signInInFlight.origin !== origin) {
+      throw new Error(
+        `A browser sign-in for ${signInInFlight.origin} is already open. Finish it, or close the window, before signing in to ${origin}.`
+      );
+    }
+    const { user, captured } = await signInInFlight.promise;
+    return { user, cookies: await seedJar(jar, captured) };
+  }
+
+  // Cleared as the window closes, so the next sign-in opens one of its own. Callers
+  // already waiting hold the promise itself and are unaffected.
+  const promise = runBrowserLogin(jiraUrl, options)
+    .finally(() => { signInInFlight = null; });
+  signInInFlight = { origin, promise };
+
+  const { user, captured } = await promise;
+  return { user, cookies: await seedJar(jar, captured) };
 }
 
 module.exports = {
