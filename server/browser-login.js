@@ -191,12 +191,20 @@ async function probeIdentity(context, jiraUrl, authHeader) {
  * `launch` exists so tests can supply a browser they also drive; it returns
  * { context, dispose }. In normal use it is a visible Chromium with a persistent profile,
  * because the whole point is that a human interacts with it.
+ *
+ * `signal` closes the window early. The wait is a poll, so teardown lands within a second
+ * of the abort rather than instantly — soon enough for a screen nobody is watching.
  */
-async function runBrowserLogin(jiraUrl, { timeoutMs = SSO_LOGIN_TIMEOUT_MS, launch, onProgress, authHeader } = {}) {
+async function runBrowserLogin(jiraUrl, { timeoutMs = SSO_LOGIN_TIMEOUT_MS, launch, onProgress, authHeader, signal } = {}) {
   const report = onProgress || (() => {});
   const origin = new URL(jiraUrl).origin;
+  const abandoned = () => new Error('Browser sign-in was abandoned — nobody was waiting for the window any more.');
+  if (signal && signal.aborted) throw abandoned();
+
   const { context, dispose } = await (launch || launchSignInBrowser)();
   try {
+    // Launching takes a moment, and the caller may have given up during it
+    if (signal && signal.aborted) throw abandoned();
     // A persistent context opens with a blank page already; reuse it rather than leaving
     // an empty window alongside the real one.
     const page = context.pages().find(p => !p.isClosed()) || await context.newPage();
@@ -205,6 +213,7 @@ async function runBrowserLogin(jiraUrl, { timeoutMs = SSO_LOGIN_TIMEOUT_MS, laun
     const deadline = Date.now() + timeoutMs;
     let lastReported = '';
     while (Date.now() < deadline) {
+      if (signal && signal.aborted) throw abandoned();
       // The identity provider often opens its own tab, so consider all of them; only an
       // empty context means the user actually gave up and closed the window.
       const pages = context.pages().filter(p => !p.isClosed());
@@ -248,7 +257,7 @@ async function runBrowserLogin(jiraUrl, { timeoutMs = SSO_LOGIN_TIMEOUT_MS, laun
  * cookies belong to the browser rather than to whoever asked first, so they seed every jar
  * waiting on that window, and each caller ends up with the session it came for.
  */
-let signInInFlight = null; // { origin, promise } while a window is open
+let signInInFlight = null; // { origin, promise, waiters, abort } while a window is open
 
 // Cookies belong to the browser, so hand the same capture to every jar waiting on it.
 async function seedJar(jar, captured) {
@@ -256,32 +265,76 @@ async function seedJar(jar, captured) {
   return captured.filter(c => GATEWAY_COOKIE_RE.test(c.name)).map(c => c.name);
 }
 
+/*
+ * Wait on the open window, and stop waiting if `signal` says this caller has gone.
+ *
+ * The window exists to serve whoever is waiting on it, so it is closed once the last of
+ * them leaves — but not before. Someone abandoning a sign-in that another request has
+ * joined must cost that other request nothing, which is why this counts waiters rather
+ * than treating the first departure as the end of the window.
+ */
+function joinSignIn(entry, signal) {
+  const waiter = {}; // identity only: a Set needs something to remove
+  entry.waiters.add(waiter);
+  const leave = () => {
+    entry.waiters.delete(waiter);
+    if (!entry.waiters.size) entry.abort.abort();
+  };
+
+  if (!signal) return entry.promise.finally(leave);
+  if (signal.aborted) {
+    leave();
+    return Promise.reject(new Error('Browser sign-in was abandoned before it began.'));
+  }
+
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      leave();
+      reject(new Error('Browser sign-in was abandoned — the request that asked for it went away.'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    // The sign-in settling is the other way out: drop the listener, and leave so a
+    // window kept open for a joiner still closes when that joiner is the last one.
+    entry.promise.then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort);
+      leave();
+    });
+  });
+}
+
 /**
  * Sign in through a browser and seed `jar` with the resulting cookies. Resolves with
  * { user, cookies }; rejects if the user closes the window or the timeout elapses.
+ *
+ * `signal` says this caller no longer wants the sign-in — an HTTP request that hung up,
+ * typically. The window goes away with the last caller waiting on it.
  */
 async function loginWithBrowser(jiraUrl, jar, options = {}) {
   const origin = new URL(jiraUrl).origin;
 
-  if (signInInFlight) {
-    // Two Jiras at once is not something one browser window can answer, and silently
-    // handing back another site's session would be worse than saying so.
-    if (signInInFlight.origin !== origin) {
-      throw new Error(
-        `A browser sign-in for ${signInInFlight.origin} is already open. Finish it, or close the window, before signing in to ${origin}.`
-      );
-    }
-    const { user, captured } = await signInInFlight.promise;
-    return { user, cookies: await seedJar(jar, captured) };
+  // Two Jiras at once is not something one browser window can answer, and silently
+  // handing back another site's session would be worse than saying so.
+  if (signInInFlight && signInInFlight.origin !== origin) {
+    throw new Error(
+      `A browser sign-in for ${signInInFlight.origin} is already open. Finish it, or close the window, before signing in to ${origin}.`
+    );
   }
 
-  // Cleared as the window closes, so the next sign-in opens one of its own. Callers
-  // already waiting hold the promise itself and are unaffected.
-  const promise = runBrowserLogin(jiraUrl, options)
-    .finally(() => { signInInFlight = null; });
-  signInInFlight = { origin, promise };
+  if (!signInInFlight) {
+    const abort = new AbortController();
+    const entry = { origin, waiters: new Set(), abort };
+    // Cleared as the window closes, so the next sign-in opens one of its own. Callers
+    // already waiting hold the promise itself and are unaffected.
+    entry.promise = runBrowserLogin(jiraUrl, { ...options, signal: abort.signal })
+      .finally(() => { if (signInInFlight === entry) signInInFlight = null; });
+    // A caller that hangs up before it ever awaits — a request already gone by the time
+    // it got here — would otherwise leave this rejection with nobody handling it, which
+    // Node treats as fatal. Every real waiter attaches its own handlers below.
+    entry.promise.catch(() => {});
+    signInInFlight = entry;
+  }
 
-  const { user, captured } = await promise;
+  const { user, captured } = await joinSignIn(signInInFlight, options.signal);
   return { user, cookies: await seedJar(jar, captured) };
 }
 

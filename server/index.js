@@ -429,6 +429,20 @@ app.post('/api/jira/sso-login', async (req, res) => {
   if (!jiraUrl) {
     return res.status(400).json({ error: 'Missing Jira URL' });
   }
+  // Nobody is coming back to a window whose request has hung up — a closed tab, a reload,
+  // a client that gave up waiting. Say so, and the sign-in browser closes instead of
+  // sitting on the screen until the five-minute timeout. Sign-ins that others joined stay
+  // open for them; only the last one waiting takes the window down with it.
+  //
+  // Listening on the response, not the request: a request's 'close' fires as soon as its
+  // body has been read, which for a POST is immediately — that would abandon every
+  // sign-in the moment it started. The response closes either when we answer it or when
+  // the client goes away, and writableEnded tells those two apart.
+  const gaveUp = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) gaveUp.abort();
+  });
+
   try {
     const jar = new tough.CookieJar();
     const auth = { authType: 'sso', jiraToken: jiraToken || undefined };
@@ -436,14 +450,21 @@ app.post('/api/jira/sso-login', async (req, res) => {
       // With a token, the browser only has to get past the gateway — Jira's own login is
       // answered by the token instead, so the window closes a step earlier.
       authHeader: buildAuthHeader(auth),
+      signal: gaveUp.signal,
       onProgress: where => console.log(`  browser sign-in is at: ${where}`)
     });
     const sessionId = uuidv4();
     jiraSessions[sessionId] = { jar, jiraUrl, auth, createdAt: Date.now(), lastUsedAt: Date.now() };
     saveSessions();
     console.log(`Browser sign-in established a Jira session for ${summary.user} (${summary.cookies.join(', ')})`);
-    res.json({ sessionId, user: summary.user });
+    // The session is worth keeping even if the client hung up mid-sign-in: it was earned,
+    // and it is restored by id like any other. Only the reply has nowhere left to go.
+    if (!res.writableEnded) res.json({ sessionId, user: summary.user });
   } catch (err) {
+    if (gaveUp.signal.aborted) {
+      console.log(`Browser sign-in dropped: ${err.message}`);
+      return; // the socket is gone; there is nobody to tell
+    }
     res.status(500).json({ error: err.message });
   }
 });
