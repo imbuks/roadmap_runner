@@ -384,6 +384,19 @@ app.use('/api/jira', (req, res, next) => {
   next();
 });
 
+/*
+ * Where the sign-in window can be watched, if it is not simply on the user's desk.
+ *
+ * Running natively, the browser opens on their own screen and there is nothing to say.
+ * In a container it opens on a virtual screen instead, and "a browser window has opened"
+ * is then quietly false: nothing pops up, and the sign-in looks hung while it sits
+ * waiting for someone who cannot see it. The image sets this to its noVNC page so the UI
+ * can point at the window rather than describing one the user will never find.
+ */
+app.get('/api/sign-in-viewer', (req, res) => {
+  res.json({ url: process.env.ROADMAP_SIGNIN_VIEWER_URL || null });
+});
+
 app.post('/api/jira/auth', async (req, res) => {
   const { jiraUrl, jiraUser, jiraToken, authType = 'basic' } = req.body;
   // PAT auth identifies the user by the token itself, so a username is not required.

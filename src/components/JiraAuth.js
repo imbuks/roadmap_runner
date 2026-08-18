@@ -12,13 +12,14 @@ import {
   Checkbox,
   Tooltip,
   Chip,
-  Divider
+  Divider,
+  Link
 } from '@mui/material';
 import {
   CheckCircle as CheckCircleIcon,
   OpenInBrowser as OpenInBrowserIcon
 } from '@mui/icons-material';
-import useJiraAuth, { AUTH_METHODS } from '../hooks/useJiraAuth';
+import useJiraAuth, { AUTH_METHODS, API_BASE } from '../hooks/useJiraAuth';
 
 /**
  * Jira authentication form. Rendered inside the app bar's connection dialog, which owns
@@ -51,6 +52,9 @@ export default function JiraAuth({ onAuthSuccess, onAuthFailure }) {
   const [localError, setLocalError] = useState('');
   // Tracked separately from authLoading so only the browser button shows its own progress
   const [browserSignIn, setBrowserSignIn] = useState(false);
+  // Set only where the sign-in window opens somewhere the user cannot see — a container's
+  // virtual screen. Null when the server runs natively and the window is on their desk.
+  const [signInViewer, setSignInViewer] = useState(null);
 
   // Load stored credentials (and preferred method) on component mount
   useEffect(() => {
@@ -67,6 +71,17 @@ export default function JiraAuth({ onAuthSuccess, onAuthFailure }) {
       setAuthMethod(storedCreds.authType);
     }
   }, [getStoredCredentials]);
+
+  // Asked up front rather than when the button is pressed: the sign-in call blocks until
+  // the user finishes, so by then there is no reply left to carry this.
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API_BASE}/api/sign-in-viewer`)
+      .then(response => response.json())
+      .then(({ url }) => { if (!cancelled && url) setSignInViewer(url); })
+      .catch(() => {}); // an older server without this route just means no link
+    return () => { cancelled = true; };
+  }, []);
 
   const handleInputChange = (field) => (event) => {
     setFormData(prev => ({
@@ -305,9 +320,25 @@ export default function JiraAuth({ onAuthSuccess, onAuthFailure }) {
         {browserSignIn ? 'Waiting for browser sign-in...' : 'Sign in with browser'}
       </Button>
 
+      {/* The window is on a screen the user cannot see, so hand them the way in. An
+          instruction to "complete the sign-in in the window that opened" is worse than
+          useless when no window ever appears on their desk. */}
+      {browserSignIn && signInViewer && (
+        <Alert severity="info" icon={<OpenInBrowserIcon fontSize="inherit" />}>
+          The sign-in window is running on the server, so nothing opens on your desktop.
+          {' '}
+          <Link href={signInViewer} target="_blank" rel="noopener noreferrer">
+            Open it here
+          </Link>
+          {' '}and complete the sign-in — including any MFA prompt.
+        </Alert>
+      )}
+
       <Typography variant="caption" color="text.secondary">
         {browserSignIn
-          ? 'A browser window has opened. Complete the sign-in there — including any MFA prompt — and it will close by itself.'
+          ? signInViewer
+            ? 'This finishes on its own once the sign-in lands on Jira.'
+            : 'A browser window has opened. Complete the sign-in there — including any MFA prompt — and it will close by itself.'
           : isPat && formData.pat?.trim()
             ? 'Opens a browser for your SSO gateway. Your token above will be used for Jira itself, so you will not be asked to log in to Jira a second time.'
             : 'Use this when your Jira sits behind a corporate SSO gateway. Opens a browser window. Tip: fill in a Personal Access Token above and you will only have to sign in once, to your organisation — Jira will not ask again.'}

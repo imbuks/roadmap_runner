@@ -59,6 +59,12 @@ ENV NODE_ENV=production \
 # safe to reopen with another platform's build
 ENV ROADMAP_BROWSER_PROFILE=/var/lib/roadmap-runner/browser-profile
 
+# The sign-in window opens on the virtual screen above, where nothing pops up on the
+# user's desk. Telling the UI where to watch it is the difference between a sign-in that
+# looks hung and one the user can actually complete. Override if you publish 6080
+# elsewhere; compose binds it to loopback on the same port.
+ENV ROADMAP_SIGNIN_VIEWER_URL=http://localhost:6080/vnc.html
+
 # 4000 serves the app and the API; 6080 is the sign-in browser over noVNC
 EXPOSE 4000 6080
 

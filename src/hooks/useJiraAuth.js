@@ -18,7 +18,7 @@ const DEFAULT_AUTH_METHOD = AUTH_METHODS.BASIC;
 // that is the default. The Docker image builds with REACT_APP_API_BASE set to an empty
 // string: there the proxy serves this bundle itself, and a relative path keeps the calls
 // on whatever host and port the container was published on.
-const API_BASE = process.env.REACT_APP_API_BASE ?? 'http://localhost:4000';
+export const API_BASE = process.env.REACT_APP_API_BASE ?? 'http://localhost:4000';
 
 // Create a global event emitter for cross-component communication
 class JiraAuthEventEmitter {
