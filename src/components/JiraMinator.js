@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   DataGrid,
   Toolbar,
@@ -31,19 +31,50 @@ import {
   FileDownload as FileDownloadIcon,
   ViewColumn as ViewColumnIcon,
   FilterList as FilterListIcon,
-  ArrowUpward as ArrowUpwardIcon,
-  ArrowDownward as ArrowDownwardIcon,
+  DragIndicator as DragIndicatorIcon,
   Difference as DifferenceIcon,
+  AutoAwesome as AutoAwesomeIcon,
+  Article as ArticleIcon,
+  AutoFixHigh as AutoFixHighIcon,
+  Undo as UndoIcon,
+  FormatBold as FormatBoldIcon,
+  FormatItalic as FormatItalicIcon,
+  FormatStrikethrough as FormatStrikethroughIcon,
+  Code as CodeIcon,
+  DataObject as DataObjectIcon,
+  FormatListBulleted as FormatListBulletedIcon,
+  FormatListNumbered as FormatListNumberedIcon,
+  FormatQuote as FormatQuoteIcon,
+  InsertLink as InsertLinkIcon,
+  CloudUpload as CloudUploadIcon,
+  CloudSync as CloudSyncIcon,
+  CheckCircleOutline as CheckCircleOutlineIcon,
+  Tune as TuneIcon,
   Fullscreen as FullscreenIcon,
   FullscreenExit as FullscreenExitIcon
 } from '@mui/icons-material';
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  useSensor,
+  useSensors
+} from '@dnd-kit/core';
+import {
+  SortableContext,
+  verticalListSortingStrategy,
+  useSortable,
+  arrayMove
+} from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 import Divider from '@mui/material/Divider';
 import MDEditor, { commands as mdCommands } from '@uiw/react-md-editor';
 import '@uiw/react-md-editor/markdown-editor.css';
 import '@uiw/react-markdown-preview/markdown.css';
-import useJiraAuth, { jiraAuthService } from '../hooks/useJiraAuth';
+import useJiraAuth, { jiraAuthService, API_BASE } from '../hooks/useJiraAuth';
 import { markdownToJira } from '../utils/markdownToJira';
 import { jiraToMarkdown } from '../utils/jiraToMarkdown';
+import StoryChat from './StoryChat';
 
 // Column visibility and order are remembered across sessions
 const COLUMN_VISIBILITY_KEY = 'jiraMinatorColumnVisibility';
@@ -76,6 +107,59 @@ const orderColumns = (cols, order) => {
 // default — it exists so the Filters panel and quick search can still work on status.
 // Issue type is shown as an icon on the summary, status as a chip under the issue key,
 // so neither needs its own column — but both stay defined so filtering and sorting work.
+/*
+ * Which of the dialog's three columns are showing, and how wide the fixed two are.
+ * Kept with the grid's own column preferences because it is the same kind of choice:
+ * made once to suit how someone works, and irritating to remake every time.
+ */
+const PANELS_KEY = 'jiraMinatorPanels';
+// Which local model the assistant talks to. Remembered per browser, since it is a taste
+// (speed against quality) rather than a property of the server.
+const AGENT_MODEL_KEY = 'jiraMinatorAgentModel';
+const DEFAULT_PANELS = { story: true, assistant: false, fields: true, assistantWidth: 380, fieldsWidth: 340 };
+const PANEL_LIMITS = { assistantWidth: [300, 720], fieldsWidth: [260, 560] };
+const PANEL_ORDER = ['story', 'assistant', 'fields'];
+const PANEL_LABELS = { story: 'the story', assistant: 'the assistant', fields: 'the fields' };
+
+const loadPanels = () => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PANELS_KEY));
+    return saved && typeof saved === 'object' ? { ...DEFAULT_PANELS, ...saved } : DEFAULT_PANELS;
+  } catch (err) {
+    return DEFAULT_PANELS;
+  }
+};
+
+/*
+ * The draggable divider between two columns. Pointer capture is what makes it usable:
+ * without it the drag is dropped the moment the cursor outruns a 6px strip, which at any
+ * real speed it immediately does.
+ */
+function PanelResizer({ onDrag }) {
+  const last = useRef(null);
+  return (
+    <Box
+      onPointerDown={e => { last.current = e.clientX; e.currentTarget.setPointerCapture(e.pointerId); }}
+      onPointerMove={e => {
+        if (last.current === null) return;
+        const dx = e.clientX - last.current;
+        last.current = e.clientX;
+        if (dx) onDrag(dx);
+      }}
+      onPointerUp={e => { last.current = null; e.currentTarget.releasePointerCapture(e.pointerId); }}
+      sx={{
+        width: 6,
+        flexShrink: 0,
+        cursor: 'col-resize',
+        bgcolor: 'divider',
+        opacity: 0.4,
+        transition: 'opacity 120ms, background-color 120ms',
+        '&:hover, &:active': { opacity: 1, bgcolor: 'primary.main' }
+      }}
+    />
+  );
+}
+
 const DEFAULT_COLUMN_VISIBILITY = { status: false, issueType: false };
 
 const loadColumnVisibility = () => {
@@ -209,6 +293,39 @@ const openInEdge = (url) => {
   window.location.href = `microsoft-edge:${url}`;
 };
 
+// Jira keys attachments by name, and a pasted screenshot is always called "image.png", so a
+// name already queued on this row is suffixed rather than left to shadow the earlier file.
+const uniqueAttachmentName = (name, taken) => {
+  const base = name || 'pasted-file';
+  if (!taken.has(base)) return base;
+  const dot = base.lastIndexOf('.');
+  const stem = dot > 0 ? base.slice(0, dot) : base;
+  const ext = dot > 0 ? base.slice(dot) : '';
+  let n = 2;
+  while (taken.has(`${stem}-${n}${ext}`)) n += 1;
+  return `${stem}-${n}${ext}`;
+};
+
+// A drag only counts as a file drop if the browser says files are on the way; dragging text or
+// a grid row over the dialog must keep behaving normally.
+const dragHasFiles = (e) => Array.from((e.dataTransfer && e.dataTransfer.types) || []).includes('Files');
+
+// "Updated 4m ago" for the table, with the full timestamp kept for the tooltip. Anything
+// older than an hour is shown as a clock time (or a date) so a stale render cannot mislead.
+const formatSyncedAt = (iso, now = Date.now()) => {
+  if (!iso) return '';
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return '';
+  const mins = Math.floor((now - then) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const date = new Date(then);
+  const sameDay = new Date(now).toDateString() === date.toDateString();
+  return sameDay
+    ? date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : date.toLocaleDateString([], { day: 'numeric', month: 'short' });
+};
+
 const formatFileSize = (bytes) => {
   if (!bytes) return '0 KB';
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
@@ -218,7 +335,7 @@ const formatFileSize = (bytes) => {
 const emptyRow = (reporter = '', reporterName = '') => ({
   summary: '',
   description: '',
-  descriptionFormat: 'jira', // 'richtext' | 'markdown' | 'jira'
+  descriptionFormat: 'jira', // 'jira' | 'markdown' ('richtext' survives only in old saved rows)
   issueType: 'Story',
   issueTypeIcon: '', // Jira's own icon URL, when the row came from Jira
   team: '',
@@ -243,8 +360,49 @@ const emptyRow = (reporter = '', reporterName = '') => ({
   attachments: [], // File objects, uploaded to Jira after the issue is created
   // Names of the above already sent to this row's issue, so repeated publishes or
   // updates do not upload the same file twice. Jira keys attachments by name too.
-  uploadedAttachments: []
+  uploadedAttachments: [],
+  // ISO timestamp of the last successful push to Jira (create or update), so the table can
+  // say how long ago the row and the issue last agreed. Session-only: rows are not persisted.
+  lastSyncedAt: ''
 });
+
+function SortableColumnRow({ field, label, visible, onToggle }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: field });
+  return (
+    <Box
+      ref={setNodeRef}
+      sx={{
+        display: 'flex', alignItems: 'center', gap: 0.5, py: 0.25,
+        borderBottom: '1px solid', borderColor: 'divider',
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.5 : 1,
+        bgcolor: isDragging ? 'action.hover' : 'transparent',
+        borderRadius: isDragging ? 1 : 0,
+      }}
+    >
+      <Box
+        {...attributes}
+        {...listeners}
+        sx={{ display: 'flex', alignItems: 'center', cursor: 'grab', color: 'text.disabled', px: 0.5 }}
+      >
+        <DragIndicatorIcon fontSize="small" />
+      </Box>
+      <Checkbox
+        size="small"
+        checked={visible}
+        onChange={e => onToggle(e.target.checked)}
+      />
+      <Typography
+        variant="body2"
+        sx={{ flex: 1, minWidth: 0, color: visible ? 'text.primary' : 'text.disabled' }}
+      >
+        {label}
+      </Typography>
+    </Box>
+  );
+}
 
 export default function JiraMinator() {
   // Use shared Jira authentication
@@ -304,9 +462,12 @@ export default function JiraMinator() {
   const epicSearchTimer = useRef(null);
   const [sprints, setSprints] = useState([]);
   const [sprintsLoading, setSprintsLoading] = useState(false);
+  const [allSprints, setAllSprints] = useState([]);
+  const [allSprintsLoading, setAllSprintsLoading] = useState(false);
   const [boards, setBoards] = useState([]);
   const [boardsLoading, setBoardsLoading] = useState(false);
   const [selectedBoard, setSelectedBoard] = useState(null);
+  const [linkCopied, setLinkCopied] = useState(false);
   const [publishingId, setPublishingId] = useState(null);
   const [updatingId, setUpdatingId] = useState(null);
   const [bulkPublishing, setBulkPublishing] = useState(false);
@@ -328,14 +489,82 @@ export default function JiraMinator() {
   const [descDiffOpen, setDescDiffOpen] = useState(false);
   const [descDiffValue, setDescDiffValue] = useState('');
   const [descDiffFormat, setDescDiffFormat] = useState('markdown');
+  const [jiraCurrentSummary, setJiraCurrentSummary] = useState(''); // title as Jira currently holds it
+  const [descDiffSummary, setDescDiffSummary] = useState('');       // editable title in the diff dialog
+  const [dragActive, setDragActive] = useState(false);              // a file is being dragged over the dialog
+  // Trailing whitespace round a title is not a change worth flagging
+  const summaryDiffers = (jiraCurrentSummary || '').trim() !== (descDiffSummary || '').trim();
   const wikiRef = useRef(null);
   const importInputRef = useRef(null);
+
+  // The relative "updated Nm ago" labels would otherwise only refresh when something else
+  // re-renders the grid, so nudge them once a minute — and only while a row has been pushed.
+  const [nowTick, setNowTick] = useState(Date.now());
+  const anySynced = rows.some(r => r.lastSyncedAt);
+  useEffect(() => {
+    if (!anySynced) return undefined;
+    const timer = setInterval(() => setNowTick(Date.now()), 60000);
+    return () => clearInterval(timer);
+  }, [anySynced]);
 
   // Below md the two dialog columns stack, so go full screen instead of a tall floating panel
   const theme = useTheme();
   const compactDialog = useMediaQuery(theme.breakpoints.down('md'));
   // Manual full screen for the create/edit dialog, on top of the automatic compact one
   const [dialogFullScreen, setDialogFullScreen] = useState(false);
+  // Live template conformance for the description, and the one-press reformat
+  const [conformance, setConformance] = useState(null);
+  const [formatting, setFormatting] = useState(false);
+  const [formatNote, setFormatNote] = useState('');
+  const [formatUndo, setFormatUndo] = useState(null);
+
+  // Which columns are showing, and how wide. Remembered between sessions.
+  const [panels, setPanels] = useState(loadPanels);
+  useEffect(() => {
+    try {
+      localStorage.setItem(PANELS_KEY, JSON.stringify(panels));
+    } catch (err) { /* storage can be blocked; the layout just will not persist */ }
+  }, [panels]);
+
+  const resizePanel = (key, delta) => setPanels(prev => {
+    const [min, max] = PANEL_LIMITS[key];
+    return { ...prev, [key]: Math.min(max, Math.max(min, prev[key] + delta)) };
+  });
+  const [agent, setAgent] = useState({ available: false, mode: null, models: [] });
+  // The chosen model, which only ever means something for a mode that has models to choose
+  // between (Ollama today). Empty until the status call says what is installed.
+  const [agentModel, setAgentModel] = useState('');
+  useEffect(() => {
+    fetch(`${API_BASE}/api/agent/status`)
+      .then(res => res.json())
+      .then(data => {
+        const models = Array.isArray(data.models) ? data.models : [];
+        setAgent({ available: Boolean(data.available), mode: data.mode, model: data.model, models });
+        // A remembered choice only survives while that model is still installed; otherwise
+        // the picker would open on a name every request then fails on.
+        let remembered = '';
+        try { remembered = localStorage.getItem(AGENT_MODEL_KEY) || ''; } catch (err) { /* storage blocked */ }
+        setAgentModel(models.includes(remembered) ? remembered : (data.model || ''));
+      })
+      .catch(() => setAgent({ available: false, mode: null, models: [] }));
+  }, []);
+
+  const chooseAgentModel = (name) => {
+    setAgentModel(name);
+    try { localStorage.setItem(AGENT_MODEL_KEY, name); } catch (err) { /* the choice just will not persist */ }
+  };
+
+  // The assistant column is only ever real when there is an agent behind it
+  const issueTypeIcon = (name) => {
+    const match = issueTypes.find(it => it.name === name);
+    if (match && match.iconUrl) return match.iconUrl;
+    return name === newRow.issueType ? (newRow.issueTypeIcon || '') : '';
+  };
+
+  const showAssistant = panels.assistant && agent.available;
+  // Whichever column is leftmost takes the slack; the ones after it keep their set widths
+  const growPanel = panels.story ? 'story' : (showAssistant ? 'assistant' : 'fields');
+
   // Wiki markup has no editor of its own, so it borrows MDEditor's edit/live/preview
   // modes: 'edit' is the textarea alone, 'live' splits it with the rendered preview
   const [wikiPreviewMode, setWikiPreviewMode] = useState('edit');
@@ -391,19 +620,54 @@ export default function JiraMinator() {
     });
   };
 
-  const WIKI_TOOLBAR = [
-    { label: 'Bold', apply: () => surroundWiki('*') },
-    { label: 'Italic', apply: () => surroundWiki('_') },
-    { label: 'Strike', apply: () => surroundWiki('-') },
-    { label: 'Code', apply: () => surroundWiki('{{', '}}') },
-    { label: 'Code block', apply: () => surroundWiki('{code}\n', '\n{code}') },
-    { label: 'H1', apply: () => prefixLinesWiki('h1. ') },
-    { label: 'H2', apply: () => prefixLinesWiki('h2. ') },
-    { label: 'H3', apply: () => prefixLinesWiki('h3. ') },
-    { label: '• List', apply: () => prefixLinesWiki('* ') },
-    { label: '1. List', apply: () => prefixLinesWiki('# ') },
-    { label: 'Quote', apply: () => prefixLinesWiki('bq. ') },
-    { label: 'Link', apply: () => surroundWiki('[', '|https://]', 'text') }
+  /*
+   * The toolbar writes whichever syntax the description is in. Same buttons either way:
+   * the difference between `*bold*` and `**bold**` is not a distinction worth making the
+   * user hold in their head while they are writing a story.
+   */
+  const MARKERS = {
+    jira: {
+      bold: ['*'], italic: ['_'], strike: ['-'],
+      code: ['{{', '}}'], codeBlock: ['{code}\n', '\n{code}'], link: ['[', '|https://]'],
+      h1: 'h1. ', h2: 'h2. ', h3: 'h3. ', bullet: '* ', number: '# ', quote: 'bq. '
+    },
+    markdown: {
+      bold: ['**'], italic: ['_'], strike: ['~~'],
+      code: ['`'], codeBlock: ['```\n', '\n```'], link: ['[', '](https://)'],
+      h1: '# ', h2: '## ', h3: '### ', bullet: '- ', number: '1. ', quote: '> '
+    }
+  };
+  // 'richtext' was a third option once; anything that is not wiki is Markdown source now
+  const descFormat = newRow.descriptionFormat === 'jira' ? 'jira' : 'markdown';
+  const marks = MARKERS[descFormat];
+  const wrap = (pair, placeholder) => surroundWiki(pair[0], pair[1] === undefined ? pair[0] : pair[1], placeholder);
+
+  /*
+   * Grouped the way any editor's toolbar is: what marks a span, what changes a block, and
+   * what inserts something. Headings keep their text because H1/H2/H3 is the label every
+   * editor uses for them and no glyph says it more clearly.
+   */
+  const TOOLBAR_GROUPS = [
+    [
+      { label: 'Bold', icon: FormatBoldIcon, apply: () => wrap(marks.bold) },
+      { label: 'Italic', icon: FormatItalicIcon, apply: () => wrap(marks.italic) },
+      { label: 'Strikethrough', icon: FormatStrikethroughIcon, apply: () => wrap(marks.strike) },
+      { label: 'Inline code', icon: CodeIcon, apply: () => wrap(marks.code) }
+    ],
+    [
+      { label: 'Heading 1', text: 'H1', apply: () => prefixLinesWiki(marks.h1) },
+      { label: 'Heading 2', text: 'H2', apply: () => prefixLinesWiki(marks.h2) },
+      { label: 'Heading 3', text: 'H3', apply: () => prefixLinesWiki(marks.h3) }
+    ],
+    [
+      { label: 'Bulleted list', icon: FormatListBulletedIcon, apply: () => prefixLinesWiki(marks.bullet) },
+      { label: 'Numbered list', icon: FormatListNumberedIcon, apply: () => prefixLinesWiki(marks.number) },
+      { label: 'Quote', icon: FormatQuoteIcon, apply: () => prefixLinesWiki(marks.quote) },
+      { label: 'Code block', icon: DataObjectIcon, apply: () => wrap(marks.codeBlock) }
+    ],
+    [
+      { label: 'Link', icon: InsertLinkIcon, apply: () => wrap(marks.link, 'text') }
+    ]
   ];
   const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
   // Look up an existing Jira issue, either to copy it into a new row ('clone')
@@ -678,8 +942,20 @@ export default function JiraMinator() {
     setPublishingId(row.id);
     try {
       const result = await doPublish(row);
+      // The issue exists in Jira from here on, so the row switches to the same footing as one
+      // loaded for editing: further changes are pushed with Update, not published again.
       setRows(prev => prev.map(r =>
-        r.id === row.id ? { ...r, issue: result.key, published: true, jiraUrl: result.url } : r
+        r.id === row.id
+          ? {
+              ...r,
+              issue: result.key,
+              published: true,
+              existing: true,
+              jiraUrl: result.url,
+              uploadedAttachments: result.uploaded || [],
+              lastSyncedAt: new Date().toISOString()
+            }
+          : r
       ));
       setPublishSuccess(`Published ${result.key}.`);
       if (result.attachmentError) {
@@ -725,7 +1001,9 @@ export default function JiraMinator() {
       }
     }
     setRows(prev => prev.map(r => (
-      r.id === row.id ? { ...r, jiraUrl: result.url, uploadedAttachments: uploaded } : r
+      r.id === row.id
+        ? { ...r, jiraUrl: result.url, uploadedAttachments: uploaded, lastSyncedAt: new Date().toISOString() }
+        : r
     )));
     return { ...result, attachmentError };
   };
@@ -813,7 +1091,15 @@ export default function JiraMinator() {
         const result = await doPublish(row);
         setRows(prev => prev.map(r =>
           r.id === row.id
-            ? { ...r, issue: result.key, published: true, jiraUrl: result.url, uploadedAttachments: result.uploaded || [] }
+            ? {
+                ...r,
+                issue: result.key,
+                published: true,
+                existing: true,
+                jiraUrl: result.url,
+                uploadedAttachments: result.uploaded || [],
+                lastSyncedAt: new Date().toISOString()
+              }
             : r
         ));
         succeeded.push(result.key);
@@ -1011,6 +1297,7 @@ export default function JiraMinator() {
   };
 
   const handleOpenCreate = () => {
+    setFormatUndo(null);
     setDialogMode('create');
     setEditingId(null);
     setNewRow(emptyRow(currentUser.key, currentUser.name));
@@ -1020,10 +1307,12 @@ export default function JiraMinator() {
   };
 
   const handleOpenEdit = (row) => {
+    setFormatUndo(null);
     setDialogMode('edit');
     setEditingId(row.id);
     setNewRow({ ...row });
     setJiraCurrentDescription(null);
+    setJiraCurrentSummary('');
     setOpenDialog(true);
 
     // For existing issues: fetch the full Jira record, populate all metadata fields into the
@@ -1039,15 +1328,15 @@ export default function JiraMinator() {
             url: data.url
           });
 
-          // Stash the Jira description so the diff button can compare it
+          // Stash the Jira title and description so the diff button can compare them
           setJiraCurrentDescription(String(jira.description ?? ''));
+          setJiraCurrentSummary(String(jira.summary ?? ''));
 
-          // Merge Jira metadata into the dialog row. The local description is preserved
-          // (that's what the user may be updating); everything else comes from Jira so
-          // the form shows the live state of the issue.
+          // Merge Jira metadata into the dialog row. The local title and description are
+          // preserved (that's what the user may be updating, and what the diff compares
+          // against); everything else comes from Jira so the form shows the live state.
           setNewRow(prev => ({
             ...prev,
-            summary:        jira.summary        || prev.summary,
             issueType:      jira.issueType       || prev.issueType,
             issueTypeIcon:  jira.issueTypeIcon   || prev.issueTypeIcon,
             team:           jira.team            || prev.team,
@@ -1064,11 +1353,11 @@ export default function JiraMinator() {
             status:         jira.status          || prev.status,
             statusCategory: jira.statusCategory  || prev.statusCategory,
             jiraUrl:        url                  || prev.jiraUrl,
-            // description and descriptionFormat are intentionally left as-is (the local
-            // CSV value is what the user wants to review / update)
+            // summary, description and descriptionFormat are intentionally left as-is (the
+            // local value is what the user wants to review / update)
           }));
         })
-        .catch(() => setJiraCurrentDescription(null))
+        .catch(() => { setJiraCurrentDescription(null); setJiraCurrentSummary(''); })
         .finally(() => setDiffLoading(false));
     }
   };
@@ -1076,13 +1365,14 @@ export default function JiraMinator() {
   // Duplicate an existing table row into a new, unpublished row
   const handleCloneRow = (row) => {
     const nextId = rows.length > 0 ? Math.max(...rows.map(r => r.id)) + 1 : 1;
-    const { published, issue, jiraUrl, existing, status, statusCategory, ...rest } = row;
+    const { published, issue, jiraUrl, existing, status, statusCategory, lastSyncedAt, ...rest } = row;
     setRows(prev => [...prev, {
       ...rest,
       id: nextId,
-      // The copy is not in Jira yet, so it has no workflow status of its own
+      // The copy is not in Jira yet, so it has no workflow status or sync time of its own
       status: '',
       statusCategory: '',
+      lastSyncedAt: '',
       attachments: [...(rest.attachments || [])],
       // The copy targets a different issue, so its files still need uploading
       uploadedAttachments: [],
@@ -1223,12 +1513,62 @@ export default function JiraMinator() {
     }
   };
 
+  // The single way files enter a row: the picker, a drop and a paste all land here.
+  const addAttachmentFiles = (fileList) => {
+    const incoming = Array.from(fileList || []).filter(Boolean);
+    if (!incoming.length) return;
+    setNewRow(prev => {
+      const existing = prev.attachments || [];
+      const taken = new Set(existing.map(f => f.name));
+      const renamed = incoming.map(file => {
+        const name = uniqueAttachmentName(file.name, taken);
+        taken.add(name);
+        return name === file.name ? file : new File([file], name, { type: file.type });
+      });
+      return { ...prev, attachments: [...existing, ...renamed] };
+    });
+  };
+
   const handleAddAttachments = (e) => {
-    const files = Array.from(e.target.files || []);
-    if (files.length) {
-      setNewRow(prev => ({ ...prev, attachments: [...(prev.attachments || []), ...files] }));
-    }
+    addAttachmentFiles(e.target.files);
     e.target.value = ''; // allow re-selecting the same file
+  };
+
+  // Drag and drop is handled on the whole dialog, not just the attachment box: a file dropped
+  // anywhere else would otherwise make the browser navigate away from the app to open it.
+  // dragDepth counts enter/leave pairs so moving over a child element doesn't clear the highlight.
+  const dragDepth = useRef(0);
+  const handleDragEnter = (e) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    dragDepth.current += 1;
+    setDragActive(true);
+  };
+  const handleDragOver = (e) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  };
+  const handleDragLeave = (e) => {
+    if (!dragHasFiles(e)) return;
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDragActive(false);
+  };
+  const handleDrop = (e) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    dragDepth.current = 0;
+    setDragActive(false);
+    addAttachmentFiles(e.dataTransfer.files);
+  };
+
+  // Pasting a screenshot, or a file copied in Finder/Explorer, attaches it. A text paste carries
+  // no files, so the description editor and every text field keep their normal behaviour.
+  const handleDialogPaste = (e) => {
+    const files = Array.from((e.clipboardData && e.clipboardData.files) || []);
+    if (!files.length) return;
+    e.preventDefault();
+    addAttachmentFiles(files);
   };
 
   // Removing a file only stops this row tracking it; anything already uploaded stays in Jira.
@@ -1242,6 +1582,142 @@ export default function JiraMinator() {
         uploadedAttachments: (prev.uploadedAttachments || []).filter(name => name !== (removed && removed.name))
       };
     });
+  };
+
+  /*
+   * The story as the assistant sees it: always Markdown, because the template is Markdown
+   * and that is what the agent is asked for. A row held as wiki markup is converted on the
+   * way out and back on the way in, so the format the user picked survives. The agent
+   * returns a whole fresh document each turn rather than editing one, so the conversion
+   * never compounds across a conversation.
+   */
+  const agentStory = {
+    summary: newRow.summary || '',
+    issueType: newRow.issueType || '',
+    storyPoints: newRow.storyPoints || '',
+    labels: newRow.labels || '',
+    description: newRow.descriptionFormat === 'jira'
+      ? jiraToMarkdown(newRow.description || '')
+      : (newRow.description || '')
+  };
+
+  /*
+   * Where the description stands against the template, kept current as you type.
+   * Costs nothing — the check is pure parsing on the server, no model — so it can run
+   * continuously instead of only when the assistant is asked.
+   */
+  const agentDescription = agentStory.description;
+
+  /*
+   * The story's own shape, as a jump list. Derived here rather than asked of the server:
+   * it is two regexes over text we already hold, and it has to keep up with typing.
+   */
+  const previewRef = useRef(null);
+  const outline = useMemo(() => {
+    const items = [];
+    agentDescription.split('\n').forEach(line => {
+      const heading = /^(#{2,3})\s+(.+)$/.exec(line);
+      if (heading) items.push({ level: heading[1].length, text: heading[2].trim() });
+    });
+    return items;
+  }, [agentDescription]);
+
+  // The preview renders headings in document order, so the nth outline entry is the nth heading
+  const jumpTo = (index) => {
+    const pane = previewRef.current;
+    if (!pane) return;
+    const target = pane.querySelectorAll('h1, h2, h3')[index];
+    if (!target) return;
+    /*
+     * Measured against the pane rather than read off offsetTop: that is relative to the
+     * nearest positioned ancestor, which is not reliably this element, and mixing the two
+     * frames gives a negative scroll that silently clamps to the top and looks like a
+     * jump list that does nothing.
+     */
+    const strip = pane.querySelector('[data-outline]');
+    const gap = (strip ? strip.offsetHeight : 0) + 8;
+    const delta = target.getBoundingClientRect().top - pane.getBoundingClientRect().top;
+    pane.scrollTo({ top: pane.scrollTop + delta - gap, behavior: 'smooth' });
+  };
+  useEffect(() => {
+    if (!openDialog || !agentDescription.trim()) {
+      setConformance(null);
+      return undefined;
+    }
+    const timer = setTimeout(() => {
+      fetch(`${API_BASE}/api/agent/validate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description: agentDescription })
+      })
+        .then(res => res.json())
+        .then(data => setConformance(data && !data.error ? data : null))
+        .catch(() => setConformance(null));
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [openDialog, agentDescription]);
+
+  /*
+   * Apply a proposal to the row, handing back what it replaced so the chat can offer Undo.
+   * The returned values are in the row's own format and marked as such, so putting them
+   * back does not run them through the Markdown conversion a second time.
+   */
+  const applyAgentPatch = (patch) => {
+    const fromRow = patch.__row === true;
+    const previous = { __row: true };
+    const next = {};
+    Object.keys(patch).forEach(field => {
+      if (field === '__row' || patch[field] === undefined) return;
+      previous[field] = newRow[field] || '';
+      next[field] = (!fromRow && field === 'description' && newRow.descriptionFormat === 'jira')
+        ? markdownToJira(patch.description)
+        : patch[field];
+    });
+    setNewRow(prev => ({ ...prev, ...next }));
+    // Land at the top of what changed rather than wherever the caret happened to be
+    if (next.description !== undefined) {
+      requestAnimationFrame(() => { if (wikiRef.current) wikiRef.current.scrollTop = 0; });
+    }
+    // One undo for the last applied change, wherever it came from, and somewhere it stays
+    // reachable — inside a chat bubble it scrolls out of sight the moment you say anything else
+    if (!fromRow) setFormatUndo(previous);
+    else setFormatUndo(null);
+    return previous;
+  };
+
+  /*
+   * One press to put the description into the canonical shape. Applied straight away
+   * rather than offered for approval: "format this" says exactly what it wants, and a
+   * confirmation step is the thing that would make it stop feeling like one press. The
+   * snackbar's Undo is the way back, and the assistant remains where things get reviewed.
+   */
+  const runMagicFormat = async () => {
+    setFormatting(true);
+    setPublishError('');
+    try {
+      const response = await fetch(`${API_BASE}/api/agent/format`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          description: agentStory.description,
+          summary: newRow.summary,
+          storyPoints: newRow.storyPoints,
+          labels: newRow.labels,
+          context: { projectKey: selectedProject ? selectedProject.key : '' },
+          model: agentModel
+        })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `Could not format the story (${response.status})`);
+      setFormatUndo(applyAgentPatch(data.patch));
+      setFormatNote(data.usedModel
+        ? `Restructured with ${agentModel || agent.model || agent.mode}.`
+        : 'Reformatted to the template.');
+    } catch (err) {
+      setPublishError(err.message);
+    } finally {
+      setFormatting(false);
+    }
   };
 
   const handleSubmitDialog = () => {
@@ -1612,6 +2088,32 @@ export default function JiraMinator() {
     }
   }, [jiraSessionId, selectedBoard]);
 
+  // When no specific board is selected, fetch sprints across all boards so the
+  // dialog sprint field isn't blocked from showing anything useful
+  useEffect(() => {
+    if (jiraSessionId && boards.length > 0) {
+      setAllSprintsLoading(true);
+      Promise.all(
+        boards.map(b =>
+          jiraAuthService.apiCall('sprints', { boardId: b.id })
+            .then(data => data.sprints || [])
+            .catch(() => [])
+        )
+      ).then(results => {
+        const seen = new Set();
+        setAllSprints(
+          results.flat().filter(s => {
+            if (seen.has(s.id)) return false;
+            seen.add(s.id);
+            return true;
+          })
+        );
+      }).finally(() => setAllSprintsLoading(false));
+    } else {
+      setAllSprints([]);
+    }
+  }, [jiraSessionId, boards]);
+
   const columns = [
     {
       field: 'summary',
@@ -1724,7 +2226,23 @@ export default function JiraMinator() {
         ) : params.value;
         return (
           <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 0.25, py: 0.75, maxWidth: '100%' }}>
-            {key}
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.25 }}>
+              {key}
+              {url && (
+                <Tooltip title="Copy link">
+                  <IconButton
+                    size="small"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      navigator.clipboard.writeText(url).then(() => setLinkCopied(true));
+                    }}
+                    sx={{ p: 0.25, opacity: 0.6, '&:hover': { opacity: 1 } }}
+                  >
+                    <ContentCopyIcon sx={{ fontSize: 12 }} />
+                  </IconButton>
+                </Tooltip>
+              )}
+            </Box>
             {params.row.status ? (
               <Tooltip title={params.row.existing ? 'Change status' : params.row.status}>
                 <Chip
@@ -1776,47 +2294,72 @@ export default function JiraMinator() {
     {
       field: 'actions',
       headerName: 'Actions',
-      width: 150,
+      width: 160,
       sortable: false,
       filterable: false,
       renderCell: (params) => (
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-          <Tooltip title="Clone this row">
-            <IconButton
-              size="small"
-              onClick={(e) => { e.stopPropagation(); handleCloneRow(params.row); }}
-            >
-              <ContentCopyIcon fontSize="inherit" />
-            </IconButton>
-          </Tooltip>
-          <Tooltip title={params.row.published ? 'Remove from table (stays in Jira)' : 'Delete this row'}>
-            <IconButton
-              size="small"
-              onClick={(e) => { e.stopPropagation(); handleDeleteRow(params.row); }}
-            >
-              <DeleteOutlineIcon fontSize="inherit" />
-            </IconButton>
-          </Tooltip>
-          {/* The issue key itself links to Jira from the Issue column */}
-          {params.row.existing ? (
-            <Button
-              size="small"
-              variant="contained"
-              color="warning"
-              disabled={updatingId !== null || publishingId !== null || bulkPublishing}
-              onClick={(e) => { e.stopPropagation(); handleUpdateRow(params.row); }}
-            >
-              {updatingId === params.row.id ? <CircularProgress size={16} /> : 'Update'}
-            </Button>
-          ) : params.row.published ? null : (
-            <Button
-              size="small"
-              variant="contained"
-              disabled={publishingId !== null || bulkPublishing}
-              onClick={(e) => { e.stopPropagation(); handlePublishRow(params.row); }}
-            >
-              {publishingId === params.row.id ? <CircularProgress size={16} /> : 'Publish'}
-            </Button>
+        <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 0.25, py: 0.75 }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+            <Tooltip title="Clone this row">
+              <IconButton
+                size="small"
+                onClick={(e) => { e.stopPropagation(); handleCloneRow(params.row); }}
+              >
+                <ContentCopyIcon fontSize="inherit" />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title={params.row.published ? 'Remove from table (stays in Jira)' : 'Delete this row'}>
+              <IconButton
+                size="small"
+                onClick={(e) => { e.stopPropagation(); handleDeleteRow(params.row); }}
+              >
+                <DeleteOutlineIcon fontSize="inherit" />
+              </IconButton>
+            </Tooltip>
+            {/* The issue key itself links to Jira from the Issue column.
+                Icons rather than labels, so the whole cell reads as one set of actions and
+                the row keeps its height — the tooltip carries what the word used to say. */}
+            {params.row.existing ? (
+              <Tooltip title={`Send changes to ${params.row.issue || 'Jira'}`}>
+                <span>
+                  <IconButton
+                    size="small"
+                    color="warning"
+                    aria-label={`Update ${params.row.issue || 'issue'} in Jira`}
+                    disabled={updatingId !== null || publishingId !== null || bulkPublishing}
+                    onClick={(e) => { e.stopPropagation(); handleUpdateRow(params.row); }}
+                  >
+                    {updatingId === params.row.id
+                      ? <CircularProgress size={16} />
+                      : <CloudSyncIcon fontSize="inherit" />}
+                  </IconButton>
+                </span>
+              </Tooltip>
+            ) : params.row.published ? null : (
+              <Tooltip title="Publish this row to Jira">
+                <span>
+                  <IconButton
+                    size="small"
+                    color="primary"
+                    aria-label="Publish to Jira"
+                    disabled={publishingId !== null || bulkPublishing}
+                    onClick={(e) => { e.stopPropagation(); handlePublishRow(params.row); }}
+                  >
+                    {publishingId === params.row.id
+                      ? <CircularProgress size={16} />
+                      : <CloudUploadIcon fontSize="inherit" />}
+                  </IconButton>
+                </span>
+              </Tooltip>
+            )}
+          </Box>
+          {/* Quiet footnote: how long ago this row and its Jira issue last agreed */}
+          {params.row.lastSyncedAt && (
+            <Tooltip title={`Last pushed to Jira on ${new Date(params.row.lastSyncedAt).toLocaleString()}`}>
+              <Typography variant="caption" color="text.disabled" sx={{ fontSize: 10.5, lineHeight: 1.2, pl: 0.25 }}>
+                updated {formatSyncedAt(params.row.lastSyncedAt, nowTick)}
+              </Typography>
+            </Tooltip>
           )}
         </Box>
       )
@@ -1847,15 +2390,7 @@ export default function JiraMinator() {
     setArrangeOpen(true);
   };
 
-  const moveDraftColumn = (index, delta) => {
-    setDraftOrder(prev => {
-      const target = index + delta;
-      if (target < 0 || target >= prev.length) return prev;
-      const next = [...prev];
-      [next[index], next[target]] = [next[target], next[index]];
-      return next;
-    });
-  };
+  const sensors = useSensors(useSensor(PointerSensor));
 
   return (
     <div style={{ padding: 20 }}>
@@ -2028,6 +2563,12 @@ export default function JiraMinator() {
         message={deletedRow ? `Removed "${deletedRow.row.summary || 'untitled row'}"` : ''}
         action={<Button color="secondary" size="small" onClick={handleUndoDelete}>Undo</Button>}
       />
+      <Snackbar
+        open={linkCopied}
+        autoHideDuration={2000}
+        onClose={() => setLinkCopied(false)}
+        message="Link copied"
+      />
 
       {/* View full description */}
       <Dialog open={viewDescription !== null} onClose={() => setViewDescription(null)} maxWidth="md" fullWidth>
@@ -2065,45 +2606,40 @@ export default function JiraMinator() {
         <DialogTitle>Columns</DialogTitle>
         <DialogContent dividers>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-            Tick to show a column, and use the arrows to order them. Both are remembered on
-            this browser.
+            Tick to show a column, drag to reorder. Both are remembered on this browser.
           </Typography>
-          {draftOrder.map((field, index) => {
-            const col = columnsByField[field];
-            if (!col) return null;
-            const visible = draftVisibility[field] !== false;
-            return (
-              <Box
-                key={field}
-                sx={{
-                  display: 'flex', alignItems: 'center', gap: 0.5, py: 0.25,
-                  borderBottom: '1px solid', borderColor: 'divider'
-                }}
-              >
-                <Checkbox
-                  size="small"
-                  checked={visible}
-                  onChange={e => setDraftVisibility(prev => ({ ...prev, [field]: e.target.checked }))}
-                />
-                <Typography
-                  variant="body2"
-                  sx={{ flex: 1, minWidth: 0, color: visible ? 'text.primary' : 'text.disabled' }}
-                >
-                  {col.headerName || field}
-                </Typography>
-                <IconButton size="small" disabled={index === 0} onClick={() => moveDraftColumn(index, -1)}>
-                  <ArrowUpwardIcon fontSize="inherit" />
-                </IconButton>
-                <IconButton
-                  size="small"
-                  disabled={index === draftOrder.length - 1}
-                  onClick={() => moveDraftColumn(index, 1)}
-                >
-                  <ArrowDownwardIcon fontSize="inherit" />
-                </IconButton>
-              </Box>
-            );
-          })}
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            onDragEnd={({ active, over }) => {
+              if (over && active.id !== over.id) {
+                setDraftOrder(prev => {
+                  const oldIndex = prev.indexOf(active.id);
+                  const newIndex = prev.indexOf(over.id);
+                  return arrayMove(prev, oldIndex, newIndex);
+                });
+              }
+            }}
+          >
+            <SortableContext items={draftOrder} strategy={verticalListSortingStrategy}>
+              {draftOrder.map((field) => {
+                const col = columnsByField[field];
+                if (!col) return null;
+                const visible = draftVisibility[field] !== false;
+                return (
+                  <SortableColumnRow
+                    key={field}
+                    field={field}
+                    label={col.headerName || field}
+                    visible={visible}
+                    onToggle={checked =>
+                      setDraftVisibility(prev => ({ ...prev, [field]: checked }))
+                    }
+                  />
+                );
+              })}
+            </SortableContext>
+          </DndContext>
         </DialogContent>
         <DialogActions>
           <Button
@@ -2356,17 +2892,46 @@ export default function JiraMinator() {
         </DialogActions>
       </Dialog>
 
-      {/* Side-by-side description diff with editable right pane */}
+      {/* Side-by-side title + description diff with an editable right pane */}
       <Dialog open={descDiffOpen} onClose={() => setDescDiffOpen(false)} maxWidth="xl" fullWidth
         slotProps={{ paper: { sx: { height: '88vh' } } }}
       >
         <DialogTitle sx={{ pb: 1 }}>
-          Description — {newRow.issue || 'compare'}
+          Title &amp; description — {newRow.issue || 'compare'}
           <Typography variant="caption" color="text.secondary" sx={{ ml: 1.5 }}>
-            Edit the right pane, then Save to apply.
+            Edit the right side, then Save to apply.
           </Typography>
         </DialogTitle>
-        <DialogContent dividers sx={{ p: 0, display: 'flex', overflow: 'hidden' }}>
+        <DialogContent dividers sx={{ p: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+
+          {/* Title, compared on the same left/right split as the description below it */}
+          <Box sx={{ display: 'flex', flexShrink: 0, borderBottom: '1px solid', borderColor: 'divider' }}>
+            <Box sx={{ flex: 1, minWidth: 0, px: 2, py: 1.5, borderRight: '2px solid', borderColor: 'divider' }}>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+                <Typography variant="subtitle2">Title in Jira</Typography>
+                <Chip
+                  size="small"
+                  label={summaryDiffers ? 'differs' : 'identical'}
+                  color={summaryDiffers ? 'warning' : 'default'}
+                  variant={summaryDiffers ? 'filled' : 'outlined'}
+                />
+              </Box>
+              <Typography sx={{ fontSize: 14, color: 'text.secondary', wordBreak: 'break-word' }}>
+                {jiraCurrentSummary || '(empty)'}
+              </Typography>
+            </Box>
+            <Box sx={{ flex: 1, minWidth: 0, px: 2, py: 1.5 }}>
+              <TextField
+                label="Title — edit here"
+                value={descDiffSummary}
+                onChange={e => setDescDiffSummary(e.target.value)}
+                size="small"
+                fullWidth
+              />
+            </Box>
+          </Box>
+
+          <Box sx={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
 
           {/* Left: current Jira value — read-only, wiki markup as plain text */}
           <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', borderRight: '2px solid', borderColor: 'divider', overflow: 'hidden' }}>
@@ -2393,7 +2958,6 @@ export default function JiraMinator() {
                 onChange={e => setDescDiffFormat(e.target.value)}
                 sx={{ minWidth: 190 }}
               >
-                <MenuItem value="richtext">Rich Text (WYSIWYG)</MenuItem>
                 <MenuItem value="markdown">Markdown (source)</MenuItem>
                 <MenuItem value="jira">Jira Wiki Markup</MenuItem>
               </TextField>
@@ -2425,17 +2989,23 @@ export default function JiraMinator() {
             </Box>
           </Box>
 
+          </Box>
         </DialogContent>
         <DialogActions sx={{ px: 2 }}>
           <Button onClick={() => setDescDiffOpen(false)}>Cancel</Button>
           <Button
             variant="contained"
             onClick={() => {
-              setNewRow(prev => ({ ...prev, description: descDiffValue, descriptionFormat: descDiffFormat }));
+              setNewRow(prev => ({
+                ...prev,
+                summary: descDiffSummary,
+                description: descDiffValue,
+                descriptionFormat: descDiffFormat
+              }));
               setDescDiffOpen(false);
             }}
           >
-            Save description
+            Save changes
           </Button>
         </DialogActions>
       </Dialog>
@@ -2471,11 +3041,16 @@ export default function JiraMinator() {
 
       <Dialog
         open={openDialog}
-        onClose={() => { setOpenDialog(false); setJiraCurrentDescription(null); }}
+        onClose={() => { setOpenDialog(false); setJiraCurrentDescription(null); setJiraCurrentSummary(''); setDragActive(false); }}
         maxWidth="lg"
         fullWidth
         fullScreen={compactDialog || dialogFullScreen}
         slotProps={{ paper: { sx: (compactDialog || dialogFullScreen) ? undefined : { height: '88vh' } } }}
+        onDragEnter={handleDragEnter}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+        onPaste={handleDialogPaste}
       >
         <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 1.5 }}>
           <Box sx={{ flex: 1 }}>
@@ -2483,8 +3058,72 @@ export default function JiraMinator() {
               ? `Edit ${newRow.issue}`
               : (dialogMode === 'edit' ? 'Edit Issue' : 'Create Jira Issue')}
           </Box>
+          {/* What kind of issue this is belongs with what the dialog says it is doing,
+              not buried in the row above the description */}
+          <Tooltip title={!selectedProject ? 'Select a project to load its issue types' : ''}>
+            <TextField
+              select
+              size="small"
+              value={newRow.issueType}
+              onChange={e => setNewRow({ ...newRow, issueType: e.target.value })}
+              disabled={issueTypesLoading}
+              sx={{ width: 165, '& .MuiInputBase-root': { fontSize: 14 } }}
+              InputProps={issueTypesLoading ? { startAdornment: <CircularProgress size={14} sx={{ mr: 1 }} /> } : undefined}
+              // Jira identifies issue types by their icon far more than by their name, so
+              // carry it into the closed select as well as the open list
+              SelectProps={{
+                renderValue: (value) => (
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                    <IssueTypeIcon name={value} iconUrl={issueTypeIcon(value)} />
+                    <Box component="span">{value}</Box>
+                  </Box>
+                )
+              }}
+            >
+              {(() => {
+                const names = issueTypes.length > 0 ? issueTypes.map(it => it.name) : ['Story'];
+                const options = names.includes(newRow.issueType) ? names : [newRow.issueType, ...names];
+                return options.map(name => (
+                  <MenuItem key={name} value={name}>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                      <IssueTypeIcon name={name} iconUrl={issueTypeIcon(name)} />
+                      <Box component="span">{name}</Box>
+                    </Box>
+                  </MenuItem>
+                ));
+              })()}
+            </TextField>
+          </Tooltip>
           {selectedProject && <Chip size="small" color="primary" label={selectedProject.key} />}
           {selectedBoard && <Chip size="small" variant="outlined" label={selectedBoard.name} />}
+          {/* Show and hide the columns. Below md they stack, so hiding one is the only way
+              to get room and the control matters more, not less. */}
+          <ToggleButtonGroup
+            size="small"
+            value={PANEL_ORDER.filter(name => panels[name])}
+            onChange={(e, next) => {
+              // An empty dialog helps nobody, so the last visible column will not turn off
+              if (!next.length) return;
+              setPanels(prev => ({
+                ...prev,
+                ...Object.fromEntries(PANEL_ORDER.map(name => [name, next.includes(name)]))
+              }));
+            }}
+            sx={{ '& .MuiToggleButton-root': { px: 1, py: 0.5 } }}
+          >
+            {PANEL_ORDER
+              // No point offering the assistant when the server has no agent to talk to
+              .filter(name => name !== 'assistant' || agent.available)
+              .map(name => (
+                <Tooltip key={name} title={`${panels[name] ? 'Hide' : 'Show'} ${PANEL_LABELS[name]}`}>
+                  <ToggleButton value={name}>
+                    {name === 'story' && <ArticleIcon fontSize="small" />}
+                    {name === 'assistant' && <AutoAwesomeIcon fontSize="small" />}
+                    {name === 'fields' && <TuneIcon fontSize="small" />}
+                  </ToggleButton>
+                </Tooltip>
+              ))}
+          </ToggleButtonGroup>
           {/* Below md the dialog is already full screen, so the toggle would do nothing */}
           {!compactDialog && (
             <Tooltip title={dialogFullScreen ? 'Exit full screen' : 'Full screen'}>
@@ -2497,6 +3136,7 @@ export default function JiraMinator() {
         <DialogContent dividers sx={{ p: 0, overflow: 'hidden', display: 'flex', flexDirection: compactDialog ? 'column' : 'row' }}>
 
           {/* Authoring column: the fields you write */}
+          {panels.story && (
           <Box sx={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 1.5, p: 2, overflowY: 'auto' }}>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
               <TextField
@@ -2507,12 +3147,25 @@ export default function JiraMinator() {
                 autoFocus
                 InputProps={{ sx: { fontSize: 18, fontWeight: 500 } }}
               />
+              {/* Points are a property of the summary line more than of the description,
+                  and putting them here buys the description a whole row of height back */}
+              {/* Default size, not small: beside a full-height Summary a small field sits
+                  short and the row reads as a mistake */}
+              <TextField
+                label="Story Points"
+                value={newRow.storyPoints}
+                onChange={e => setNewRow({ ...newRow, storyPoints: e.target.value })}
+                // Same type scale as Summary, or the taller font leaves it 3px short
+                InputProps={{ sx: { fontSize: 18, fontWeight: 500 } }}
+                sx={{ width: 132, flexShrink: 0 }}
+              />
               {newRow.existing && newRow.issue && (
-                <Tooltip title={diffLoading ? `Loading ${newRow.issue}…` : jiraCurrentDescription === null ? 'Sign in to Jira to compare' : 'Compare description to current Jira'}>
+                <Tooltip title={diffLoading ? `Loading ${newRow.issue}…` : jiraCurrentDescription === null ? 'Sign in to Jira to compare' : 'Compare title and description to current Jira'}>
                   <span>
                     <IconButton
                       disabled={diffLoading || jiraCurrentDescription === null}
                       onClick={() => {
+                        setDescDiffSummary(newRow.summary || '');
                         setDescDiffValue(newRow.description || '');
                         setDescDiffFormat(newRow.descriptionFormat || 'jira');
                         setDescDiffOpen(true);
@@ -2525,66 +3178,50 @@ export default function JiraMinator() {
               )}
             </Box>
 
-            <Box sx={{ flex: 1, minHeight: 240, display: 'flex', flexDirection: 'column' }}>
-              <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1.5, mb: 2.5 }}>
-                <TextField
-                  select
-                  size="small"
-                  label="Description Format"
-                  value={newRow.descriptionFormat || 'jira'}
-                  onChange={e => setNewRow({ ...newRow, descriptionFormat: e.target.value })}
-                  sx={{ flex: 1, minWidth: 200 }}
-                >
-                  <MenuItem value="richtext">Rich Text (Markdown WYSIWYG)</MenuItem>
-                  <MenuItem value="markdown">Markdown (source)</MenuItem>
-                  <MenuItem value="jira">Jira Wiki Markup</MenuItem>
-                </TextField>
-                <TextField
-                  select
-                  size="small"
-                  label="Issue Type"
-                  value={newRow.issueType}
-                  onChange={e => setNewRow({ ...newRow, issueType: e.target.value })}
-                  sx={{ flex: 1, minWidth: 140 }}
-                  disabled={issueTypesLoading}
-                  helperText={
-                    issueTypesLoading
-                      ? 'Loading issue types…'
-                      : (!selectedProject ? 'Select a project to load its issue types' : '')
-                  }
-                >
-                  {(() => {
-                    const names = issueTypes.length > 0 ? issueTypes.map(it => it.name) : ['Story'];
-                    const options = names.includes(newRow.issueType) ? names : [newRow.issueType, ...names];
-                    return options.map(name => (
-                      <MenuItem key={name} value={name}>{name}</MenuItem>
-                    ));
-                  })()}
-                </TextField>
-                <TextField
-                  size="small"
-                  label="Story Points"
-                  value={newRow.storyPoints}
-                  onChange={e => setNewRow({ ...newRow, storyPoints: e.target.value })}
-                  sx={{ width: 120 }}
-                />
-              </Box>
-              {newRow.descriptionFormat === 'jira' && (
+            {/*
+              * minHeight is the whole fix for the overlap: this block may shrink, but not
+              * below what its own chrome needs (metadata row + toolbar + a usable editor +
+              * the footer, ~340px). It used to stop at 240 and spill over the Labels field.
+              * Shrinking rather than growing also matters — a block that grows to fit its
+              * content makes the column scroll and the preview never does, and then the
+              * outline has nothing to scroll and long stories are no easier to read.
+              */}
+            <Box sx={{ flex: '1 1 auto', minHeight: 360, display: 'flex', flexDirection: 'column' }}>
+              {/* One toolbar for both formats; the buttons write whichever syntax is selected */}
+              {(
                 // Enough room below the buttons for the field's floating label to clear them
                 <Box sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 0.5, mb: 3 }}>
-                  {WIKI_TOOLBAR.map(btn => (
-                    <Button
-                      key={btn.label}
-                      size="small"
-                      variant="outlined"
-                      onClick={btn.apply}
-                      // With the textarea hidden there is no selection to wrap
-                      disabled={wikiPreviewMode === 'preview'}
-                      sx={{ minWidth: 0, px: 1, textTransform: 'none' }}
-                    >
-                      {btn.label}
-                    </Button>
+                  {TOOLBAR_GROUPS.map((group, groupIndex) => (
+                    <React.Fragment key={groupIndex}>
+                      {groupIndex > 0 && (
+                        <Divider orientation="vertical" flexItem sx={{ mx: 0.25, my: 0.75 }} />
+                      )}
+                      {group.map(btn => {
+                        const Glyph = btn.icon;
+                        return (
+                          <Tooltip key={btn.label} title={btn.label}>
+                            <span>
+                              <IconButton
+                                size="small"
+                                onClick={btn.apply}
+                                // The tooltip wraps a span (so it still shows when disabled),
+                                // which means the button needs to name itself
+                                aria-label={btn.label}
+                                // With the textarea hidden there is no selection to wrap
+                                disabled={wikiPreviewMode === 'preview'}
+                                sx={{ borderRadius: 1, width: 30, height: 30 }}
+                              >
+                                {Glyph
+                                  ? <Glyph sx={{ fontSize: 18 }} />
+                                  : <Box component="span" sx={{ fontSize: 12, fontWeight: 700, lineHeight: 1 }}>{btn.text}</Box>}
+                              </IconButton>
+                            </span>
+                          </Tooltip>
+                        );
+                      })}
+                    </React.Fragment>
                   ))}
+                  <Box sx={{ ml: 'auto', display: 'flex', alignItems: 'center', gap: 0.75 }}>
                   {/* The same edit / live / preview control MDEditor shows for Markdown,
                       down to its icons, so both description formats look alike */}
                   <ToggleButtonGroup
@@ -2594,7 +3231,7 @@ export default function JiraMinator() {
                     value={wikiPreviewMode}
                     onChange={(e, value) => value && setWikiPreviewMode(value)}
                     // The icons carry a hard-coded 12px size, so scale them here
-                    sx={{ ml: 'auto', '& svg': { width: 14, height: 14 } }}
+                    sx={{ '& svg': { width: 14, height: 14 } }}
                   >
                     {[
                       { value: 'edit', title: 'Write only', icon: mdCommands.codeEdit.icon },
@@ -2608,13 +3245,8 @@ export default function JiraMinator() {
                       </Tooltip>
                     ))}
                   </ToggleButtonGroup>
+                  </Box>
                 </Box>
-              )}
-              {/* The Markdown editors have no built-in label, unlike the wiki TextField */}
-              {newRow.descriptionFormat !== 'jira' && (
-                <Typography variant="caption" color="text.secondary" sx={{ mt: 1, mb: 0.5 }}>
-                  Description
-                </Typography>
               )}
               {/* Measured so the editor fills whatever height the dialog leaves it */}
               <Box
@@ -2629,13 +3261,15 @@ export default function JiraMinator() {
                   gap: 1.5
                 }}
               >
-                {newRow.descriptionFormat === 'jira' ? (wikiPreviewMode !== 'preview' && (
+                {wikiPreviewMode !== 'preview' && (
                   <TextField
                     label="Description"
                     value={newRow.description}
                     onChange={e => setNewRow({ ...newRow, description: e.target.value })}
                     inputRef={wikiRef}
-                    placeholder="Sent to Jira as-is, e.g. *bold*, _italic_, h1."
+                    placeholder={descFormat === 'jira'
+                      ? 'Sent to Jira as-is, e.g. *bold*, _italic_, h1.'
+                      : 'Markdown, e.g. **bold**, _italic_, # Heading.'}
                     fullWidth
                     multiline
                     // Stretch the textarea to the measured area instead of guessing a row count,
@@ -2648,50 +3282,142 @@ export default function JiraMinator() {
                       '& .MuiInputBase-inputMultiline': { height: '100% !important', overflow: 'auto !important' }
                     }}
                   />
-                )) : (
-                  <Box sx={{ flex: 1, minWidth: 0 }}>
-                    <MDEditor
-                      value={newRow.description}
-                      onChange={(value) => setNewRow({ ...newRow, description: value || '' })}
-                      preview={newRow.descriptionFormat === 'markdown' ? 'edit' : 'live'}
-                      height={editorHeight}
-                      data-color-mode="light"
-                    />
-                  </Box>
                 )}
-                {/* Wiki markup has no live renderer of its own, so convert to Markdown
-                    and reuse the renderer the other formats already use */}
-                {newRow.descriptionFormat === 'jira' && wikiPreviewMode !== 'edit' && (
+                {/* One preview for both formats. Wiki markup has no renderer of its own, so
+                    it is converted to Markdown and shown through the same one. */}
+                {wikiPreviewMode !== 'edit' && (
                   <Box
+                    ref={previewRef}
                     data-color-mode="light"
                     sx={{
                       flex: 1,
                       minWidth: 0,
                       overflow: 'auto',
+                      position: 'relative',
                       p: 1.5,
                       border: 1,
                       borderColor: 'divider',
                       borderRadius: 1,
-                      bgcolor: 'background.paper'
+                      bgcolor: 'background.paper',
+                      // Keeps a jumped-to heading clear of the sticky outline above it
+                      '& h1, & h2, & h3': { scrollMarginTop: '64px' }
                     }}
                   >
                     <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
                       Preview — approximate; Jira renders the markup itself
                     </Typography>
+                    {/* A jump list for a story too long to scan. Below three headings there is
+                        nothing to navigate and the strip is just clutter, so it stays away. */}
+                    {outline.length >= 3 && (
+                      <Box
+                        data-outline=""
+                        sx={{
+                          position: 'sticky',
+                          top: 0,
+                          zIndex: 1,
+                          display: 'flex',
+                          flexWrap: 'wrap',
+                          gap: 0.5,
+                          py: 0.75,
+                          mb: 1,
+                          bgcolor: 'background.paper',
+                          borderBottom: 1,
+                          borderColor: 'divider'
+                        }}
+                      >
+                        {outline.map((item, i) => (
+                          <Chip
+                            key={`${i}-${item.text}`}
+                            size="small"
+                            variant="outlined"
+                            clickable
+                            onClick={() => jumpTo(i)}
+                            label={item.text}
+                            sx={{
+                              height: 20,
+                              maxWidth: 190,
+                              // Criteria sit under their section, so let the eye see the nesting
+                              ml: item.level === 3 ? 1 : 0,
+                              borderStyle: item.level === 3 ? 'dashed' : 'solid',
+                              '& .MuiChip-label': { fontSize: 11, px: 0.75 }
+                            }}
+                          />
+                        ))}
+                      </Box>
+                    )}
                     {newRow.description
                       ? <MDEditor.Markdown
-                          source={jiraToMarkdown(newRow.description)}
+                          source={descFormat === 'jira' ? jiraToMarkdown(newRow.description) : newRow.description}
                           style={{ backgroundColor: 'transparent' }}
                         />
                       : <Typography variant="body2" color="text.disabled">Nothing to preview yet.</Typography>}
                   </Box>
                 )}
               </Box>
-              <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5 }}>
-                {newRow.descriptionFormat === 'jira'
-                  ? 'Wiki markup is sent to Jira unchanged.'
-                  : 'Markdown is converted to Jira wiki markup on publish.'}
-              </Typography>
+              {/* Everything about the description sits under it: what it is written in on
+                  the left, where it stands in the middle, what to do about it on the right */}
+              <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1, mt: 0.75 }}>
+                <ToggleButtonGroup
+                  exclusive
+                  size="small"
+                  color="primary"
+                  value={descFormat}
+                  onChange={(e, value) => value && setNewRow(prev => ({ ...prev, descriptionFormat: value }))}
+                  sx={{ '& .MuiToggleButton-root': { px: 1, py: 0.25, textTransform: 'none', fontSize: 12 } }}
+                >
+                  <ToggleButton value="jira">Wiki</ToggleButton>
+                  <ToggleButton value="markdown">Markdown</ToggleButton>
+                </ToggleButtonGroup>
+                <Typography variant="caption" color="text.secondary">
+                  {descFormat === 'jira'
+                    ? 'Wiki markup is sent to Jira unchanged.'
+                    : 'Markdown is converted on publish.'}
+                </Typography>
+                {/* Where this story stands against the template, at all times rather than
+                    only when the assistant is asked */}
+                {conformance && (
+                  <Tooltip title={conformance.violations.length
+                    ? conformance.violations.join(' ')
+                    : 'This description follows the story template'}>
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      // Three states, not two: a story can parse as the template and still
+                      // not be canonical — misnumbered criteria being the usual case — and
+                      // calling that a clean match would be a small lie told constantly.
+                      color={conformance.conforms && !conformance.violations.length ? 'success' : 'default'}
+                      icon={conformance.conforms && !conformance.violations.length
+                        ? <CheckCircleOutlineIcon sx={{ fontSize: 14 }} />
+                        : undefined}
+                      label={conformance.conforms
+                        ? (conformance.violations.length
+                          ? `${conformance.violations.length} tidy-up${conformance.violations.length === 1 ? '' : 's'}`
+                          : `Matches template · ${conformance.criteria} criteria`)
+                        : `${conformance.violations.length} template issue${conformance.violations.length === 1 ? '' : 's'}`}
+                      sx={{ height: 20, '& .MuiChip-label': { fontSize: 11, px: 0.75 } }}
+                    />
+                  </Tooltip>
+                )}
+                {agent.available && (
+                  <Tooltip title="Reshape this description into the story template">
+                    <span style={{ marginLeft: 'auto' }}>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        color="primary"
+                        disabled={formatting || !(newRow.description || '').trim()}
+                        startIcon={formatting
+                          ? <CircularProgress size={14} color="inherit" />
+                          : <AutoFixHighIcon sx={{ fontSize: 16 }} />}
+                        onClick={runMagicFormat}
+                        sx={{ minWidth: 0, px: 1, textTransform: 'none' }}
+                      >
+                        Magic Format
+                      </Button>
+                    </span>
+                  </Tooltip>
+                )}
+              </Box>
             </Box>
 
             <Autocomplete
@@ -2709,7 +3435,18 @@ export default function JiraMinator() {
               )}
             />
 
-            <Box>
+            {/* Files can be picked, dropped anywhere on the dialog, or pasted. The box is the
+                visible target and shows the highlight while a drag is in flight. */}
+            <Box
+              sx={{
+                border: '1px dashed',
+                borderColor: dragActive ? 'primary.main' : 'divider',
+                bgcolor: dragActive ? 'action.hover' : 'transparent',
+                borderRadius: 1,
+                p: 1.5,
+                transition: 'border-color 120ms, background-color 120ms'
+              }}
+            >
               <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
                 Attachments{(newRow.attachments || []).length > 0 ? ` (${newRow.attachments.length})` : ''}
               </Typography>
@@ -2717,6 +3454,9 @@ export default function JiraMinator() {
                 Add Files
                 <input type="file" hidden multiple onChange={handleAddAttachments} />
               </Button>
+              <Typography variant="caption" color={dragActive ? 'primary.main' : 'text.secondary'} sx={{ display: 'block', mt: 0.75 }}>
+                {dragActive ? 'Drop to attach' : 'Or drop files anywhere on this dialog, or paste them (screenshots included).'}
+              </Typography>
               {(newRow.attachments || []).length > 0 ? (
                 <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, mt: 1 }}>
                   {newRow.attachments.map((file, idx) => {
@@ -2744,16 +3484,60 @@ export default function JiraMinator() {
               )}
             </Box>
           </Box>
+          )}
+
+          {/* Stacked columns have no vertical edge to drag */}
+          {showAssistant && panels.story && !compactDialog && (
+            <PanelResizer onDrag={dx => resizePanel('assistantWidth', -dx)} />
+          )}
+
+          {/* Assistant rail. It sits beside the authoring column on purpose: those are the
+              fields it is allowed to touch, and the metadata column beyond it is not. */}
+          {showAssistant && (
+            <Box
+              sx={{
+                width: (compactDialog || growPanel === 'assistant') ? 'auto' : panels.assistantWidth,
+                flex: growPanel === 'assistant' ? 1 : '0 0 auto',
+                minWidth: 0,
+                flexShrink: 0,
+                minHeight: compactDialog ? 360 : 0,
+                borderLeft: (compactDialog || !panels.story) ? 0 : '1px solid',
+                borderTop: compactDialog ? '1px solid' : 0,
+                borderColor: 'divider'
+              }}
+            >
+              {/* Keyed by the row being edited, so moving to another story starts a new
+                  conversation rather than carrying the last one's context into it */}
+              <StoryChat
+                key={editingId == null ? 'new' : editingId}
+                story={agentStory}
+                context={{ projectKey: selectedProject ? selectedProject.key : '' }}
+                mode={agent.mode}
+                model={agentModel || agent.model}
+                models={agent.models}
+                onModelChange={chooseAgentModel}
+                onApply={applyAgentPatch}
+                onClose={() => setPanels(prev => ({ ...prev, assistant: false }))}
+              />
+            </Box>
+          )}
+
+          {panels.fields && (panels.story || showAssistant) && !compactDialog && (
+            <PanelResizer onDrag={dx => resizePanel('fieldsWidth', -dx)} />
+          )}
 
           {/* Metadata column: the fields you pick */}
+          {panels.fields && (
           <Box
             sx={{
-              width: compactDialog ? 'auto' : 340,
+              width: (compactDialog || growPanel === 'fields') ? 'auto' : panels.fieldsWidth,
+              flex: growPanel === 'fields' ? 1 : '0 0 auto',
+              minWidth: 0,
               flexShrink: 0,
               p: 2,
               overflowY: 'auto',
               bgcolor: 'grey.50',
-              borderLeft: compactDialog ? 0 : '1px solid',
+              borderLeft: (compactDialog || growPanel === 'fields') ? 0 : '1px solid',
               borderTop: compactDialog ? '1px solid' : 0,
               borderColor: 'divider'
             }}
@@ -2883,21 +3667,30 @@ export default function JiraMinator() {
             />
             <Autocomplete
               size="small"
-              options={sprints}
+              options={selectedBoard ? sprints : allSprints}
               getOptionLabel={option => option ? option.name : ''}
-              loading={sprintsLoading}
-              value={sprints.find(s => s.name === newRow.sprint) || null}
+              loading={selectedBoard ? sprintsLoading : allSprintsLoading}
+              value={
+                (selectedBoard ? sprints : allSprints).find(s => s.name === newRow.sprint) || null
+              }
               onChange={(_, value) => setNewRow({ ...newRow, sprint: value ? value.name : '' })}
               renderInput={(params) => (
-                <TextField {...params} label="Sprint" variant="outlined" fullWidth margin="dense" InputProps={{ ...params.InputProps, endAdornment: (
-                  <>
-                    {sprintsLoading ? <CircularProgress color="inherit" size={20} /> : null}
-                    {params.InputProps.endAdornment}
-                  </>
-                ) }} />
+                <TextField
+                  {...params}
+                  label={selectedBoard ? 'Sprint' : 'Sprint (all boards)'}
+                  variant="outlined"
+                  fullWidth
+                  margin="dense"
+                  InputProps={{ ...params.InputProps, endAdornment: (
+                    <>
+                      {(selectedBoard ? sprintsLoading : allSprintsLoading) ? <CircularProgress color="inherit" size={20} /> : null}
+                      {params.InputProps.endAdornment}
+                    </>
+                  ) }}
+                />
               )}
               isOptionEqualToValue={(option, value) => option.id === value.id}
-              disabled={!selectedBoard || sprintsLoading}
+              disabled={!selectedProject || (selectedBoard ? sprintsLoading : allSprintsLoading)}
             />
             <TextField size="small" label="Linked Issues" value={newRow.linkedIssues} onChange={e => setNewRow({ ...newRow, linkedIssues: e.target.value })} fullWidth margin="dense" />
             <TextField size="small" label="Issue" value={newRow.issue} onChange={e => setNewRow({ ...newRow, issue: e.target.value })} fullWidth margin="dense" />
@@ -2939,6 +3732,7 @@ export default function JiraMinator() {
               </Box>
             )}
           </Box>
+          )}
         </DialogContent>
         <DialogActions sx={{ px: 2 }}>
           <Typography variant="caption" color="text.secondary" sx={{ flex: 1 }}>
@@ -2948,12 +3742,38 @@ export default function JiraMinator() {
                 ? `Adds ${parseInt(instanceCount, 10)} rows to the table.`
                 : '')}
           </Typography>
+          {/* Both Magic Format and the assistant write into the row, so one undo for the
+              last of them, here where it stays put. A snackbar's ten seconds is not a way
+              back, and a chat bubble scrolls away. */}
+          {formatUndo && (
+            <Button
+              size="small"
+              startIcon={<UndoIcon fontSize="small" />}
+              onClick={() => {
+                applyAgentPatch(formatUndo);
+                setFormatUndo(null);
+                setFormatNote('');
+              }}
+              sx={{ textTransform: 'none' }}
+            >
+              Undo last change
+            </Button>
+          )}
           <Button onClick={() => setOpenDialog(false)}>Cancel</Button>
           <Button onClick={handleSubmitDialog} variant="contained">
             {dialogMode === 'edit' || newRow.existing ? 'Save' : 'Add'}
           </Button>
         </DialogActions>
       </Dialog>
+
+      {/* Magic Format writes straight to the row, so the way back has to be obvious */}
+      <Snackbar
+        open={Boolean(formatNote)}
+        autoHideDuration={10000}
+        onClose={() => setFormatNote('')}
+        message={formatNote}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+      />
     </div>
   );
 }

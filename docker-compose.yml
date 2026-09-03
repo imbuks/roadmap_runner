@@ -28,9 +28,59 @@ services:
       # DEBUG=1 turns on per-request tracing (the JQL sent, the fields that came back).
       # Off by default so the log stays down to sign-ins, warnings, and errors.
       DEBUG: "${DEBUG:-}"
+      # The story assistant. Unset means AGENT_MODE=mock, which answers locally: the rail
+      # works, but says "mock" and talks to nothing. See the README for the real thing.
+      AGENT_MODE: "${AGENT_MODE:-}"
+      AGENT_TOKEN_ENDPOINT: "${AGENT_TOKEN_ENDPOINT:-}"
+      AGENT_DIRECTLINE_SECRET: "${AGENT_DIRECTLINE_SECRET:-}"
+      AGENT_URL: "${AGENT_URL:-}"
+      AGENT_KEY: "${AGENT_KEY:-}"
+      # AGENT_MODE=ollama runs the model on your machine. From in here "localhost" is the
+      # container, so the host is reached by name — and Ollama must be listening on more
+      # than 127.0.0.1 for that to connect at all (see the README).
+      AGENT_OLLAMA_URL: "${AGENT_OLLAMA_URL:-http://host.docker.internal:11434}"
+      AGENT_OLLAMA_MODEL: "${AGENT_OLLAMA_MODEL:-}"
+    # Docker Desktop resolves host.docker.internal already; this adds it on Linux too
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # Chromium outgrows Docker's 64MB default and starts crashing on heavier pages
     shm_size: "1gb"
     restart: unless-stopped
+
+  # Ollama in a container, for a deployment that should carry its own model rather than
+  # lean on one installed on the host. Opt in with `--profile ollama`, so the default
+  # `docker compose up` is exactly what it was.
+  #
+  #   docker compose --profile ollama up -d --build
+  #
+  # Then point the app at it, in .env:  AGENT_MODE=ollama
+  #                                     AGENT_OLLAMA_URL=http://ollama:11434
+  #
+  # On macOS this runs on the CPU: containers get no Metal, so a model that answers in
+  # seconds natively will take considerably longer here. On a Linux host with an NVIDIA
+  # card, uncomment the `deploy` block below and it runs on the GPU instead.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: roadmap-ollama
+    profiles: ["ollama"]
+    volumes:
+      # The host's model store, so the models already pulled are reused rather than
+      # downloaded again. Run one Ollama at a time — two of them pulling into the same
+      # directory is the one way to get them to disagree.
+      - "${HOME}/.ollama:/root/.ollama"
+    # Deliberately not published. The app reaches it over the compose network by name,
+    # and nothing else has any business talking to it.
+    expose:
+      - "11434"
+    restart: unless-stopped
+    # Linux + NVIDIA only; on macOS this block does nothing but stop the container starting
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
 
 volumes:
   browser-profile:

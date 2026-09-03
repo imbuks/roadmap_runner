@@ -1,4 +1,7 @@
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+// Pull AGENT_* out of .env before anything reads it. Deliberately not dotenv — see server/env.js.
+const { loadAgentEnv } = require('./env');
+const agentEnvKeys = loadAgentEnv();
 const express = require('express');
 const fetch = require('node-fetch');
 const fetchCookie = require('fetch-cookie');
@@ -11,6 +14,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { loginWithBrowser } = require('./browser-login');
+const { registerAgentRoutes } = require('./agent');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -1415,12 +1419,46 @@ app.post('/api/jira/epic-issues', async (req, res) => {
 });
 
 /**
+ * Resolve a sprint name (or id) to the numeric sprint id Jira's sprint field expects.
+ * The dialog lets a sprint be picked without choosing a board, so when no board is
+ * given every board on the project is searched. Returns null when nothing matches.
+ */
+async function resolveSprintId({ fetchWithCookies, jiraUrl, authHeader, boardId, projectKey, sprint }) {
+  const wanted = String(sprint).trim();
+  if (!wanted) return null;
+  const headers = { 'Authorization': authHeader, 'Accept': 'application/json' };
+
+  let boardIds = boardId ? [boardId] : [];
+  if (boardIds.length === 0 && projectKey) {
+    const boardsRes = await fetchWithCookies(
+      `${jiraUrl}/rest/agile/1.0/board?projectKeyOrId=${encodeURIComponent(projectKey)}`,
+      { headers, redirect: 'follow' }
+    );
+    if (!boardsRes.ok) return null;
+    const boardsData = JSON.parse(await boardsRes.text());
+    boardIds = (boardsData.values || []).map(b => b.id);
+  }
+
+  for (const id of boardIds) {
+    const spRes = await fetchWithCookies(`${jiraUrl}/rest/agile/1.0/board/${id}/sprint?state=active,future`, {
+      headers,
+      redirect: 'follow'
+    });
+    if (!spRes.ok) continue;
+    const spData = JSON.parse(await spRes.text());
+    const match = (spData.values || []).find(s => s.name === wanted || String(s.id) === wanted);
+    if (match) return match.id;
+  }
+  return null;
+}
+
+/**
  * Map a table row onto Jira's `fields` object, shared by create-story and update-story.
  * Custom field IDs vary per Jira instance, so they are resolved by name first.
  * Only non-empty values are written: an empty epic link / sprint / CI leaves whatever
  * Jira already has rather than risking a rejection on a required field.
  */
-async function buildIssueFields({ fetchWithCookies, jiraUrl, authHeader, boardId, values }) {
+async function buildIssueFields({ fetchWithCookies, jiraUrl, authHeader, boardId, projectKey, values }) {
   const { epicLinkField, storyPointsField, sprintField, appCIField, teamField } =
     await findTableFields(fetchWithCookies, jiraUrl, authHeader);
 
@@ -1448,18 +1486,14 @@ async function buildIssueFields({ fetchWithCookies, jiraUrl, authHeader, boardId
   if (team && teamField) {
     fields[teamField.id] = String(team);
   }
-  // Sprint field expects a numeric sprint id; resolve from the board by name (best effort)
-  if (sprint && sprintField && boardId) {
+  // Sprint field expects a numeric sprint id; resolve it by name (best effort)
+  if (sprint && sprintField) {
     try {
-      const spRes = await fetchWithCookies(`${jiraUrl}/rest/agile/1.0/board/${boardId}/sprint?state=active,future`, {
-        headers: { 'Authorization': authHeader, 'Accept': 'application/json' },
-        redirect: 'follow'
+      const sprintId = await resolveSprintId({
+        fetchWithCookies, jiraUrl, authHeader, boardId, projectKey, sprint
       });
-      if (spRes.ok) {
-        const spData = JSON.parse(await spRes.text());
-        const match = (spData.values || []).find(s => s.name === sprint || String(s.id) === String(sprint));
-        if (match) fields[sprintField.id] = match.id;
-      }
+      if (sprintId != null) fields[sprintField.id] = sprintId;
+      else console.warn('No open sprint matched', sprint, boardId ? `on board ${boardId}` : `on project ${projectKey}`);
     } catch (e) {
       console.warn('Could not resolve sprint id for', sprint, e.message);
     }
@@ -1483,7 +1517,7 @@ app.post('/api/jira/create-story', async (req, res) => {
   const fetchWithCookies = makeJiraFetch(jar, jiraUrl, auth);
   const authHeader = buildAuthHeader(auth);
   try {
-    const fields = await buildIssueFields({ fetchWithCookies, jiraUrl, authHeader, boardId, values: req.body });
+    const fields = await buildIssueFields({ fetchWithCookies, jiraUrl, authHeader, boardId, projectKey, values: req.body });
     fields.project = { key: projectKey };
     fields.issuetype = { name: issueType || 'Story' };
 
@@ -1524,7 +1558,10 @@ app.post('/api/jira/update-story', async (req, res) => {
   const authHeader = buildAuthHeader(auth);
   const key = issueKey.trim();
   try {
-    const fields = await buildIssueFields({ fetchWithCookies, jiraUrl, authHeader, boardId, values: req.body });
+    // The issue's own project supplies the boards to search when no board is selected
+    const fields = await buildIssueFields({
+      fetchWithCookies, jiraUrl, authHeader, boardId, projectKey: key.split('-')[0], values: req.body
+    });
     // Only send an issue type change when one was chosen; some workflows reject the move
     if (issueType) fields.issuetype = { name: issueType };
 
@@ -1890,6 +1927,10 @@ app.post('/api/jira/attach', upload.array('files'), async (req, res) => {
   }
 });
 
+// The story-refinement agent. Not under /api/jira: it needs no Jira session, and the
+// keepalive middleware on that prefix has nothing to do for it.
+registerAgentRoutes(app);
+
 // Serve the built UI from this same origin, which is how the Docker image runs: one
 // published port covers both the app and the proxy, and the browser needs no CORS hop.
 // Opt-in, so `npm run server` alongside the CRA dev server keeps behaving as before and
@@ -1911,4 +1952,5 @@ loadSessions();
 
 app.listen(PORT, () => {
   console.log(`Jira proxy server running on port ${PORT}`);
+  if (agentEnvKeys.length) console.log(`Story assistant: read ${agentEnvKeys.join(', ')} from .env`);
 });

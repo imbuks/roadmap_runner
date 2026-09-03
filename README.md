@@ -149,6 +149,124 @@ Two environment variables are worth knowing about, beyond the keepalive ones abo
 alongside the dev server never answers with a stale bundle), and `REACT_APP_API_BASE`
 is baked in empty at image build time so API calls stay same-origin.
 
+## Wiring in the story assistant
+
+The story editor has a chat rail that refines one story and harmonizes it to the canonical
+format. Out of the box it runs against a local stand-in — the rail works and says **mock**,
+but nothing is being asked. Pointing it at the real agent is configuration, not code.
+
+**If the story logic lives in your Copilot Studio agent** (the usual case), talk to the agent:
+
+1. In Copilot Studio, open **Channels → Custom website** (or **Mobile app**) and copy the
+   **Token Endpoint URL**.
+2. Check **Settings → Security → Authentication**. This has to be **No authentication** for
+   the token endpoint to be usable on its own. "Authenticate with Microsoft" means an Entra
+   app registration and user tokens, which this does not yet do.
+3. Set the endpoint and restart the server:
+
+   ```
+   AGENT_MODE=directline
+   AGENT_TOKEN_ENDPOINT=https://…/directline/token?api-version=…
+   ```
+
+Treat that URL as a secret: anyone holding it can talk to your agent. It belongs in the
+environment or in `.env`, never in the bundle — which is why the browser never sees it and
+every call goes through the proxy.
+
+**If you have no Copilot Studio credits** — or would rather the story text never left the
+machine — run a model locally with [Ollama](https://ollama.com) instead:
+
+```
+AGENT_MODE=ollama AGENT_OLLAMA_MODEL=llama3.1 npm run server
+```
+
+Note the shape of that: the proxy reads its configuration from the **environment**, not from
+`.env`. Nothing here loads that file — `docker compose` substitutes it into the compose file,
+which is why the Docker instructions below can say "in your `.env`", but `npm run server`
+never sees it. Export the variables in your shell if you would rather not retype them.
+
+(Adding `dotenv` to the server would be the obvious tidy-up and is a trap: `.env` sets
+`PORT=4040` for the CRA dev server, and the proxy reading that would move it off 4000 —
+which is where `API_BASE` points by default.)
+
+Nothing else is needed: no key, no endpoint, no account. `ollama serve` has to be running
+and the model pulled (`ollama pull llama3.1`), and the rail hides itself when it isn't
+rather than offering a button that only errors.
+
+`AGENT_OLLAMA_MODEL` names the model the assistant *opens* on, not the only one it can use:
+every model installed on the host is listed, and the chip naming the current one in the
+assistant's header is a picker. Switching it changes which model answers the next turn and
+the next Magic Format — the transcript is resent whole each turn, so a conversation can
+change model mid-way — and the choice is remembered in that browser. There is nothing to
+restart, though the list is read once when the page loads: pull a model and reload. An 8B model holds the story format well —
+what it costs you is a first request that waits for the model to load (about 45s here) and
+roughly 12s a turn after that. A smaller model is faster and asks more clarifying
+questions instead of inventing detail, which is not the worst trait in a story assistant.
+
+Format drift is the thing to expect from a small model, and it is handled rather than
+hoped away: a reply that breaks the format is re-requested once with the specific failures
+named, criteria that come back misnumbered are renumbered, and anything the model invents
+about the Epic, Team or Sprint is dropped before you see it.
+
+**Want Ollama in Docker too?** There is an opt-in profile for it, so the container carries
+its own model rather than depending on one installed on the host:
+
+```
+docker compose --profile ollama up -d --build
+```
+
+with `AGENT_MODE=ollama` and `AGENT_OLLAMA_URL=http://ollama:11434` in your `.env` (this is
+the Docker path, where compose does read that file). The app
+reaches it by service name over the compose network, so none of the host-networking
+awkwardness below applies. Your existing `~/.ollama` is mounted in, so the models you have
+already pulled are reused rather than downloaded again — but run one Ollama at a time.
+Nothing new is published: only the app can reach it. To pull a model into it:
+
+```
+docker compose exec ollama ollama pull llama3.1
+```
+
+The reason not to, on a Mac: containers get no Metal, so this runs on the CPU and a model
+that answers in seconds natively will take substantially longer. Give Docker Desktop enough
+memory for the model too — an 8B model at Q4 wants ~6 GB, and the container is simply killed
+if it cannot have it. On a Linux host with an NVIDIA card there is no penalty: uncomment the
+`deploy` block in `docker-compose.yml` and it runs on the GPU.
+
+**Running the app in Docker and Ollama on the host?** Two things bite. `localhost` inside
+the container is the container, so the URL has to be `http://host.docker.internal:11434`
+(the compose file already defaults to it). And Ollama listens on `127.0.0.1` by default,
+which refuses that connection — start it as `OLLAMA_HOST=0.0.0.0 ollama serve`, or set the
+same variable in the Ollama app's settings.
+
+**If the logic lives in a Power Automate flow instead**, use its HTTP-trigger URL:
+
+```
+AGENT_MODE=flow
+AGENT_URL=https://prod-…/workflows/…/triggers/manual/paths/invoke?…&sig=…
+```
+
+The flow is handed `{ system, messages, story, context }` and should answer with the reply
+text, either bare or as JSON under `reply`, `text`, `output` or `result`.
+
+**Magic Format** is the one-press version: it reshapes the description into the template
+without opening the chat. A story that already parses is reformatted by the parser alone —
+instant, free, and no model involved — so the button only waits when the text genuinely has
+to be restructured. It applies straight away; **Undo format** stays in the dialog footer
+until you do something else.
+
+The badge under the editor says where the description stands at all times: *Matches
+template*, *N tidy-ups* (it parses, but something like criterion numbering is off), or *N
+template issues*. That check is pure parsing, so it costs nothing and needs no agent.
+
+Either way the agent is asked for the canonical story format and its answer is checked
+against it before it reaches the grid: acceptance criteria are renumbered if they drift, an
+over-long title is truncated, a reply missing a required section is asked for again, and
+anything the agent tries to say about the Epic, Team or Sprint is dropped. Those fields stay
+yours to choose. Nothing is written to a story without you pressing **Apply**.
+
+If the agent takes its time, `AGENT_REPLY_TIMEOUT_MS` (60s) and `AGENT_REPLY_QUIET_MS` (2s —
+how long a reply must stay finished before it counts as complete) are both tunable.
+
 ## Turning the noise up
 
 By default the log carries only what you would want to see on a normal day: sign-ins,
