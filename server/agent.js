@@ -19,7 +19,9 @@ const {
   toPublishableDescription,
   checkConformance,
   buildSystemPrompt,
-  splitReply
+  splitReply,
+  listTemplates,
+  resolveTemplate
 } = require('./story-template');
 
 const DEBUG = /^(1|true|yes|on)$/i.test(process.env.DEBUG || '');
@@ -68,48 +70,53 @@ const MAX_CHARS = 12000;    // per message, so one pasted essay cannot run away
  * in a fenced block. It echoes the current story back through the template, so applying
  * its reply exercises the real parse/validate/patch path rather than a happy path.
  */
-function mockAgent({ messages, story }) {
+function mockAgent({ messages, story, template }) {
+  const shape = template || resolveTemplate({});
   const ask = [...messages].reverse().find(m => m.role === 'user');
   const askText = (ask && ask.content) || '';
   const title = (story.summary || 'Untitled story').slice(0, 240);
+  // What the row already says, so a second turn visibly builds on the first
+  const current = parseStoryDoc(story.description || '');
 
-  // Reuse the criteria already in the description when there are any, so a second turn
-  // visibly builds on the first rather than starting over.
-  const existing = String(story.description || '').match(/^###[ \t]+AC\d+[ \t]*:[ \t]*(.*)$/gm) || [];
-  const titles = existing.map(h => h.replace(/^###[ \t]+AC\d+[ \t]*:[ \t]*/, '').trim());
-  if (titles.length === 0) titles.push('Happy path', 'Validation failure');
-  if (askText) titles.push(askText.slice(0, 60).replace(/\s+/g, ' ').trim());
+  const criteria = () => {
+    const titles = current.criteria.map(c => c.title).filter(Boolean);
+    if (titles.length === 0) titles.push('Happy path', 'Validation failure');
+    if (askText) titles.push(askText.slice(0, 60).replace(/\s+/g, ' ').trim());
+    return titles.map((t, i) => [
+      `### AC${i + 1}: ${t}`,
+      '**Given** the user is on the story screen',
+      `**When** they ${t.toLowerCase()}`,
+      '**Then** the outcome is observable and testable'
+    ].join('\n')).join('\n\n');
+  };
 
-  const criteria = titles.map((t, i) => [
-    `### AC${i + 1}: ${t}`,
-    `**Given** the user is on the story screen`,
-    `**When** they ${t.toLowerCase()}`,
-    `**Then** the outcome is observable and testable`
-  ].join('\n')).join('\n\n');
+  // The template's own sections, in its order, so the mock exercises whichever format the
+  // row resolved to rather than a story shape hardcoded here.
+  const body = shape.sections
+    .filter(sec => sec.name !== 'Notes')
+    .map((sec) => {
+      if (sec.name === 'Acceptance Criteria') return `## Acceptance Criteria\n\n${criteria()}`;
+      const existing = current.sections[sec.name];
+      if (existing) return `## ${sec.name}\n\n${existing}`;
+      if (sec.name === 'User Story') {
+        return ['## User Story', '', '**As a** delivery team member',
+          `**I want** ${title.toLowerCase()}`,
+          '**So that** the work is understood before it is picked up'].join('\n');
+      }
+      return `## ${sec.name}\n\n(mock) ${sec.name} for "${title}".`;
+    })
+    .join('\n\n');
 
   const doc = [
     `**Story Title:** ${title}`,
     `**Story Points:** ${story.storyPoints || 3}`,
     `**Labels:** ${story.labels || 'needs-review'}`,
     '',
-    '## User Story',
-    '',
-    '**As a** delivery team member',
-    `**I want** ${title.toLowerCase()}`,
-    '**So that** the work is understood before it is picked up',
-    '',
-    '## Business Value',
-    '',
-    '- Removes ambiguity before development starts',
-    '- Makes the story testable as written',
-    '',
-    '## Acceptance Criteria',
-    '',
-    criteria
+    body
   ].join('\n');
 
   return [
-    `(mock agent) Harmonized the story to the template${askText ? ` and folded in: "${askText.slice(0, 80)}"` : ''}.`,
+    `(mock agent) Harmonized the ${shape.type} to the ${shape.label} template${askText ? ` and folded in: "${askText.slice(0, 80)}"` : ''}.`,
     '',
     '```story',
     doc,
@@ -122,7 +129,7 @@ function mockAgent({ messages, story }) {
  * trigger, or anything else shaped like one. Use this when the generation logic lives in
  * the flow; if it lives in the Copilot Studio agent, use Direct Line below instead.
  */
-async function callFlow({ messages, story, context, intent }) {
+async function callFlow({ messages, story, context, intent, template }) {
   if (!AGENT_URL) {
     throw new Error('AGENT_MODE=flow needs AGENT_URL. Set it to the endpoint URL, or set AGENT_MODE=mock.');
   }
@@ -132,7 +139,11 @@ async function callFlow({ messages, story, context, intent }) {
       'Content-Type': 'application/json',
       ...(AGENT_KEY ? { 'Authorization': `Bearer ${AGENT_KEY}` } : {})
     },
-    body: JSON.stringify({ system: buildSystemPrompt({ intent }), messages, story, context, intent })
+    body: JSON.stringify({
+      system: buildSystemPrompt({ intent, template }),
+      messages, story, context, intent,
+      template: template && template.id
+    })
   });
   const text = await response.text();
   if (!response.ok) {
@@ -191,8 +202,8 @@ function storyBlock(story) {
 
 // Everything the agent needs to answer this turn, as one message. Direct Line has no
 // notion of a system prompt or a message history, so everything is flattened into one.
-function composeTurn({ messages, story, context, intent }) {
-  const parts = [buildSystemPrompt({ intent }), ''];
+function composeTurn({ messages, story, context, intent, template }) {
+  const parts = [buildSystemPrompt({ intent, template }), ''];
   if (context && context.projectKey) parts.push(`Jira project: ${context.projectKey}`, '');
   parts.push('The story as it currently stands:', storyBlock(story), '');
   parts.push('Conversation so far:');
@@ -299,14 +310,14 @@ async function listOllamaModels() {
     .filter(name => typeof name === 'string' && name);
 }
 
-async function callOllama({ messages, story, context, intent, model }) {
+async function callOllama({ messages, story, context, intent, model, template }) {
   const modelName = pickOllamaModel(model);
   const history = messages.slice(0, -1);
   const last = messages[messages.length - 1];
   const project = context && context.projectKey ? `Jira project: ${context.projectKey}\n\n` : '';
 
   const chat = [
-    { role: 'system', content: buildSystemPrompt({ intent }) },
+    { role: 'system', content: buildSystemPrompt({ intent, template }) },
     ...history.map(m => ({ role: m.role, content: m.content })),
     { role: 'user', content: `${project}The story as it currently stands:\n\n${storyBlock(story)}\n\n${last.content}` }
   ];
@@ -381,15 +392,15 @@ const callAgent = (payload) => {
 
 // Turn a raw reply into the shape the client renders: prose for the bubble, a validated
 // patch for the Apply button, and the deviations that were repaired along the way.
-function harmonize(raw) {
+function harmonize(raw, template) {
   const { prose, document } = splitReply(raw);
   if (!document) return { reply: prose, patch: null, violations: [], hard: [] };
 
   const doc = parseStoryDoc(document);
-  const { violations, hard } = validateStoryDoc(doc);
+  const { violations, hard } = validateStoryDoc(doc, { template });
   if (hard.length > 0) return { reply: prose, patch: null, violations, hard };
 
-  return { reply: prose, patch: toPatch(doc), violations, hard: [] };
+  return { reply: prose, patch: toPatch(doc, template), violations, hard: [] };
 }
 
 /*
@@ -399,7 +410,7 @@ function harmonize(raw) {
  * than a fourth wait. Shared by the chat and the one-press format, which fail the same way.
  */
 async function askWithRepair(payload) {
-  const first = harmonize(await callAgent(payload));
+  const first = harmonize(await callAgent(payload), payload.template);
   if (first.hard.length === 0) return first;
 
   debug('Story agent broke the format, re-asking:', first.hard);
@@ -412,12 +423,28 @@ async function askWithRepair(payload) {
         + 'with every field and criterion filled in.'
     }]
   };
-  const second = harmonize(await callAgent(retry));
+  const second = harmonize(await callAgent(retry), payload.template);
   if (second.hard.length > 0) return first; // no better; report the original diagnosis
   return { ...second, violations: [...second.violations, 'The first reply did not follow the format and was re-requested.'] };
 }
 
+/*
+ * Which format this request is about. The row's issue type picks the folder and the
+ * person's choice picks the variant within it; both are hints, and `resolveTemplate`
+ * falls back rather than failing, so a Jira type nobody has written a template for is
+ * still formatted as a story instead of erroring.
+ */
+const templateFor = (body) => resolveTemplate({
+  issueType: body && body.issueType,
+  variant: body && body.templateVariant
+});
+
 function registerAgentRoutes(app) {
+  // What templates exist, so the dialog can offer the variants this type actually has.
+  app.get('/api/agent/templates', (req, res) => {
+    res.json({ templates: listTemplates() });
+  });
+
   app.post('/api/agent/chat', async (req, res) => {
     const { messages, story, context, model } = req.body || {};
     if (!Array.isArray(messages) || messages.length === 0) {
@@ -435,7 +462,11 @@ function registerAgentRoutes(app) {
 
     // model is honoured by the ollama transport and ignored by the rest, which have no
     // model to choose between
-    const payload = { messages: turns, story: story || {}, context: context || {}, intent: 'refine', model };
+    const template = templateFor(req.body);
+    const payload = {
+      messages: turns, story: story || {}, context: context || {},
+      intent: 'refine', model, template
+    };
 
     try {
       const result = await askWithRepair(payload);
@@ -444,11 +475,17 @@ function registerAgentRoutes(app) {
         return res.json({
           reply: result.reply || 'The agent did not return a story in the expected format.',
           patch: null,
-          violations: result.violations
+          violations: result.violations,
+          template: template.id
         });
       }
 
-      res.json({ reply: result.reply, patch: result.patch, violations: result.violations });
+      res.json({
+        reply: result.reply,
+        patch: result.patch,
+        violations: result.violations,
+        template: template.id
+      });
     } catch (err) {
       console.warn('Story agent failed:', err.message);
       res.status(502).json({ error: err.message });
@@ -464,7 +501,7 @@ function registerAgentRoutes(app) {
     if (typeof description !== 'string') {
       return res.status(400).json({ error: 'description is required.' });
     }
-    res.json(checkConformance(description));
+    res.json(checkConformance(description, templateFor(req.body)));
   });
 
   /*
@@ -481,14 +518,17 @@ function registerAgentRoutes(app) {
       return res.status(400).json({ error: 'There is no description to format yet.' });
     }
 
+    const template = templateFor(req.body);
     const doc = parseStoryDoc(description);
     // A description carries no title line, so its absence is not a reason to call a model
-    const { violations, hard } = validateStoryDoc(doc, { requireTitle: false });
-    if (hard.length === 0 && doc.criteria.length > 0) {
+    const { violations, hard } = validateStoryDoc(doc, { requireTitle: false, template });
+    const wantsCriteria = template.required.includes('Acceptance Criteria');
+    if (hard.length === 0 && (!wantsCriteria || doc.criteria.length > 0)) {
       return res.json({
-        patch: { description: toPublishableDescription(doc) },
+        patch: { description: toPublishableDescription(doc, template) },
         violations,
-        usedModel: false
+        usedModel: false,
+        template: template.id
       });
     }
 
@@ -499,11 +539,12 @@ function registerAgentRoutes(app) {
 
     try {
       const payload = {
-        messages: [{ role: 'user', content: 'Reformat this story into the canonical format.' }],
+        messages: [{ role: 'user', content: `Reformat this ${template.type} into the canonical format.` }],
         story: { summary, description, storyPoints, labels },
         context: context || {},
         intent: 'format',
-        model
+        model,
+        template
       };
       const result = await askWithRepair(payload);
       if (!result.patch) {
@@ -513,7 +554,7 @@ function registerAgentRoutes(app) {
             : 'The model did not return a story document.'
         });
       }
-      res.json({ patch: result.patch, violations: result.violations, usedModel: true });
+      res.json({ patch: result.patch, violations: result.violations, usedModel: true, template: template.id });
     } catch (err) {
       console.warn('Magic Format failed:', err.message);
       res.status(502).json({ error: err.message });

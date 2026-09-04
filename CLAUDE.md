@@ -125,14 +125,31 @@ where a description stands against the template on every keystroke for free. `/a
 (the dialog's Magic Format) tries the parser first and only calls a model when the text does not
 already parse — a conforming story reformats in ~20ms instead of ~14s, and cannot drift.
 
-[server/story-template.js](server/story-template.js) is where the canonical story format
-(`server/story-template.md`) is enforced, because a model asked nicely for a format drifts. It parses
-the reply, repairs what is safe to repair (renumbering ACs, truncating an over-long title), and reports
-every deviation to the UI rather than fixing things silently; a document missing a required section is
-re-requested once. Three things it strips before anything reaches Jira: the template's instruction
-comment, the `**Field:** value` metadata lines (they map to Jira *fields*, not description text), and
-the Notes section. `toPatch` allowlists the result to the authored fields only, so a hallucinated epic
-key, team or sprint is dropped rather than trusted — the same split the dialog's two columns draw.
+[server/story-template.js](server/story-template.js) is where the canonical formats are enforced,
+because a model asked nicely for a format drifts. It parses the reply, repairs what is safe to repair
+(renumbering ACs, truncating an over-long title), and reports every deviation to the UI rather than
+fixing things silently; a document missing a required section is re-requested once. Three things it
+strips before anything reaches Jira: the template's instruction comment, the `**Field:** value`
+metadata lines (they map to Jira *fields*, not description text), and the Notes section. `toPatch`
+allowlists the result to the authored fields only, so a hallucinated epic key, team or sprint is
+dropped rather than trusted — the same split the dialog's two columns draw.
+
+The formats themselves live in `server/templates/<type>/<variant>.md` — `story/detailed.md`,
+`story/simple.md`, `bug/default.md`, `task/default.md` today. **Nothing in the JS names a section**:
+the level-2 headings in the file are the format, in the file's own order, and a heading marked
+`(Optional)` is the only kind a document may leave out. Adding, renaming or reordering a section is
+therefore a text edit in one file, with no code change and no restart — templates are re-read when
+their mtime changes, since a stale in-memory copy looks exactly like the edit not having worked.
+Two names the code does know: `Acceptance Criteria`, whose `### ACn:` headings the parser pulls
+apart, and `Notes`, which is never published.
+
+An optional frontmatter block (`label:`, `default:`) carries the picker's label and which variant a
+type opens on. `resolveTemplate` falls back type-first — `<type>/<variant>` → the type's default →
+`story` — so an issue type nobody has written a template for is still formatted as a story rather
+than failing, and a Bug is formatted as a bug even when the chosen variant does not exist for it.
+Every agent route takes `issueType` and `templateVariant` and resolves per request; `GET
+/api/agent/templates` is what the dialog's picker is built from, and the chosen variant is remembered
+per issue type in `localStorage` under `jiraMinatorTemplateVariants`.
 
 Validation checks substance, not only shape. A model told firmly enough not to invent will return
 the template's headings with every field blank, which passes any structural check; `validateStoryDoc`

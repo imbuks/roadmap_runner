@@ -1,12 +1,6 @@
-# User Story: <Short descriptive name>
-
-**Story Title:** <One concise line that becomes the Jira summary>
-**Epic:** <Jira epic key, or leave blank>
-**Priority:** High
-**Story Points:** 5
-**Labels:** frontend, search
-**Status:** Ready for Development
-
+---
+label: Detailed
+default: true
 ---
 
 ## User Story
@@ -17,9 +11,7 @@
 
 ---
 
----
-
-## Background
+## Background (Optional)
 
 <Why is this relevant: What happened, why now.>
 

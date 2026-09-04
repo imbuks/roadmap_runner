@@ -131,7 +131,7 @@ function ProposedChanges({ patch, story, onApply }) {
   );
 }
 
-export default function StoryChat({ story, context, mode, model, models = [], onModelChange, onApply, onClose }) {
+export default function StoryChat({ story, context, mode, model, models = [], template, onModelChange, onApply, onClose }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
@@ -166,7 +166,9 @@ export default function StoryChat({ story, context, mode, model, models = [], on
           story,
           context,
           // Ignored by the modes that have no model to choose between
-          model
+          model,
+          // Which shape to answer in: the row's issue type and the variant chosen for it
+          ...(template || {})
         })
       });
       const data = await response.json();
@@ -185,7 +187,7 @@ export default function StoryChat({ story, context, mode, model, models = [], on
     } finally {
       setSending(false);
     }
-  }, [input, sending, messages, story, context, model]);
+  }, [input, sending, messages, story, context, model, template]);
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>

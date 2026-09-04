@@ -116,6 +116,12 @@ const PANELS_KEY = 'jiraMinatorPanels';
 // Which local model the assistant talks to. Remembered per browser, since it is a taste
 // (speed against quality) rather than a property of the server.
 const AGENT_MODEL_KEY = 'jiraMinatorAgentModel';
+/*
+ * Which template variant each issue type opens on, e.g. `{ story: 'simple' }`. Remembered
+ * per type rather than globally: someone who writes simple stories still wants the full
+ * bug shape, and a single remembered choice would fight them on every other row.
+ */
+const TEMPLATE_KEY = 'jiraMinatorTemplateVariants';
 const DEFAULT_PANELS = { story: true, assistant: false, fields: true, assistantWidth: 380, fieldsWidth: 340 };
 const PANEL_LIMITS = { assistantWidth: [300, 720], fieldsWidth: [260, 560] };
 const PANEL_ORDER = ['story', 'assistant', 'fields'];
@@ -553,6 +559,27 @@ export default function JiraMinator() {
     setAgentModel(name);
     try { localStorage.setItem(AGENT_MODEL_KEY, name); } catch (err) { /* the choice just will not persist */ }
   };
+
+  /*
+   * The templates the server holds, one folder per issue type. Fetched once: they are
+   * files on disk, and the picker only needs to know which types have a shape of their own
+   * and what a person may choose within one.
+   */
+  const [templates, setTemplates] = useState([]);
+  const [templateVariants, setTemplateVariants] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(TEMPLATE_KEY));
+      return saved && typeof saved === 'object' ? saved : {};
+    } catch (err) {
+      return {};
+    }
+  });
+  useEffect(() => {
+    fetch(`${API_BASE}/api/agent/templates`)
+      .then(res => res.json())
+      .then(data => setTemplates(Array.isArray(data.templates) ? data.templates : []))
+      .catch(() => setTemplates([]));
+  }, []);
 
   // The assistant column is only ever real when there is an agent behind it
   const issueTypeIcon = (name) => {
@@ -1602,6 +1629,46 @@ export default function JiraMinator() {
   };
 
   /*
+   * Which template this row is authored against: the folder for its issue type when one
+   * exists, in the variant this person last chose for that type. The fallback mirrors the
+   * server's, so the picker never shows a shape the server would not have resolved to.
+   */
+  const templateEntry = useMemo(() => {
+    const slug = String(newRow.issueType || '').trim().toLowerCase().replace(/\s+/g, '-');
+    return templates.find(t => t.type === slug) || templates.find(t => t.type === 'story') || null;
+  }, [templates, newRow.issueType]);
+
+  // Whether this row is being shaped by another type's template, which the picker has to
+  // say out loud — the fallback is useful, but only if it is visible
+  const templateIsFallback = Boolean(templateEntry)
+    && templateEntry.type !== String(newRow.issueType || '').trim().toLowerCase().replace(/\s+/g, '-');
+
+  // Only worth a control when there is a choice in it. A type with one shape is told by
+  // the conformance chip below the description, which names the template either way.
+  const showTemplatePicker = Boolean(templateEntry) && templateEntry.variants.length > 1;
+
+  const templateVariant = templateEntry
+    ? (templateEntry.variants.some(v => v.variant === templateVariants[templateEntry.type])
+      ? templateVariants[templateEntry.type]
+      : templateEntry.defaultVariant)
+    : '';
+
+  const chooseTemplateVariant = (variant) => {
+    if (!templateEntry) return;
+    const next = { ...templateVariants, [templateEntry.type]: variant };
+    setTemplateVariants(next);
+    try { localStorage.setItem(TEMPLATE_KEY, JSON.stringify(next)); } catch (err) { /* the choice just will not persist */ }
+  };
+
+  // Sent with every agent call, so the server resolves the same template the picker shows.
+  // Memoized because it is a dependency of the chat's send, which should not be rebuilt on
+  // every keystroke in the description.
+  const templateChoice = useMemo(
+    () => ({ issueType: newRow.issueType || '', templateVariant }),
+    [newRow.issueType, templateVariant]
+  );
+
+  /*
    * Where the description stands against the template, kept current as you type.
    * Costs nothing — the check is pure parsing on the server, no model — so it can run
    * continuously instead of only when the assistant is asked.
@@ -1648,14 +1715,16 @@ export default function JiraMinator() {
       fetch(`${API_BASE}/api/agent/validate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ description: agentDescription })
+        body: JSON.stringify({ description: agentDescription, ...templateChoice })
       })
         .then(res => res.json())
         .then(data => setConformance(data && !data.error ? data : null))
         .catch(() => setConformance(null));
     }, 600);
     return () => clearTimeout(timer);
-  }, [openDialog, agentDescription]);
+    // Re-checked when the template changes too: the same text conforms to one shape and not another
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openDialog, agentDescription, templateChoice.issueType, templateChoice.templateVariant]);
 
   /*
    * Apply a proposal to the row, handing back what it replaced so the chat can offer Undo.
@@ -1704,7 +1773,8 @@ export default function JiraMinator() {
           storyPoints: newRow.storyPoints,
           labels: newRow.labels,
           context: { projectKey: selectedProject ? selectedProject.key : '' },
-          model: agentModel
+          model: agentModel,
+          ...templateChoice
         })
       });
       const data = await response.json();
@@ -3059,15 +3129,25 @@ export default function JiraMinator() {
               : (dialogMode === 'edit' ? 'Edit Issue' : 'Create Jira Issue')}
           </Box>
           {/* What kind of issue this is belongs with what the dialog says it is doing,
-              not buried in the row above the description */}
+              not buried in the row above the description. The template variant is welded to
+              its right edge because it is the same choice continued: the type picks the
+              shape, and this picks which of that type's shapes. */}
+          <Box sx={{ display: 'flex', alignItems: 'center' }}>
           <Tooltip title={!selectedProject ? 'Select a project to load its issue types' : ''}>
             <TextField
               select
               size="small"
+              label="Issue Type"
               value={newRow.issueType}
               onChange={e => setNewRow({ ...newRow, issueType: e.target.value })}
               disabled={issueTypesLoading}
-              sx={{ width: 165, '& .MuiInputBase-root': { fontSize: 14 } }}
+              sx={{
+                width: 165,
+                '& .MuiInputBase-root': {
+                  fontSize: 14,
+                  ...(showTemplatePicker ? { borderTopRightRadius: 0, borderBottomRightRadius: 0 } : {})
+                }
+              }}
               InputProps={issueTypesLoading ? { startAdornment: <CircularProgress size={14} sx={{ mr: 1 }} /> } : undefined}
               // Jira identifies issue types by their icon far more than by their name, so
               // carry it into the closed select as well as the open list
@@ -3094,6 +3174,45 @@ export default function JiraMinator() {
               })()}
             </TextField>
           </Tooltip>
+          {/* Labelled, because "Simple" on its own says nothing about what it governs */}
+          {showTemplatePicker && (
+            <TextField
+              select
+              size="small"
+              label="AI Formatting"
+              value={templateVariant}
+              onChange={e => chooseTemplateVariant(e.target.value)}
+              SelectProps={{
+                // Named by its type only when this row fell back to another type's shape:
+                // sitting against the issue type, a bare "Detailed" beside "Spike" would
+                // claim a Spike template that does not exist.
+                renderValue: (v) => {
+                  const label = templateEntry.variants.find(x => x.variant === v)?.label || v;
+                  return templateIsFallback ? `${templateEntry.label} · ${label}` : label;
+                }
+              }}
+              sx={{
+                // Pulled onto the type select's border so the pair reads as one control
+                ml: '-1px',
+                // Wide enough for the label and for either variant name, so switching does
+                // not shunt the column toggles along the title bar
+                minWidth: 150,
+                '& .MuiInputBase-root': {
+                  fontSize: 13,
+                  color: 'text.secondary',
+                  borderTopLeftRadius: 0,
+                  borderBottomLeftRadius: 0
+                },
+                // Otherwise the neighbour's border sits on top of this one's focus ring
+                '&:hover, &:focus-within': { zIndex: 1 }
+              }}
+            >
+              {templateEntry.variants.map(v => (
+                <MenuItem key={v.id} value={v.variant} sx={{ fontSize: 14 }}>{v.label}</MenuItem>
+              ))}
+            </TextField>
+          )}
+          </Box>
           {selectedProject && <Chip size="small" color="primary" label={selectedProject.key} />}
           {selectedBoard && <Chip size="small" variant="outlined" label={selectedBoard.name} />}
           {/* Show and hide the columns. Below md they stack, so hiding one is the only way
@@ -3294,7 +3413,11 @@ export default function JiraMinator() {
                       minWidth: 0,
                       overflow: 'auto',
                       position: 'relative',
-                      p: 1.5,
+                      // No padding at the top: a sticky child sticks to the padding box, so
+                      // any top padding here becomes a band above the outline that content
+                      // scrolls through in full view. The strip carries that space instead.
+                      px: 1.5,
+                      pb: 1.5,
                       border: 1,
                       borderColor: 'divider',
                       borderRadius: 1,
@@ -3303,7 +3426,7 @@ export default function JiraMinator() {
                       '& h1, & h2, & h3': { scrollMarginTop: '64px' }
                     }}
                   >
-                    <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
+                    <Typography variant="caption" color="text.secondary" sx={{ display: 'block', pt: 1.5, mb: 1 }}>
                       Preview — approximate; Jira renders the markup itself
                     </Typography>
                     {/* A jump list for a story too long to scan. Below three headings there is
@@ -3318,7 +3441,13 @@ export default function JiraMinator() {
                           display: 'flex',
                           flexWrap: 'wrap',
                           gap: 0.5,
-                          py: 0.75,
+                          // Bled over the pane's side padding and given the top space the
+                          // pane no longer has, so the strip's own background is what
+                          // covers the text passing underneath — edge to edge, no gap.
+                          mx: -1.5,
+                          px: 1.5,
+                          pt: 1,
+                          pb: 0.75,
                           mb: 1,
                           bgcolor: 'background.paper',
                           borderBottom: 1,
@@ -3378,7 +3507,7 @@ export default function JiraMinator() {
                 {conformance && (
                   <Tooltip title={conformance.violations.length
                     ? conformance.violations.join(' ')
-                    : 'This description follows the story template'}>
+                    : `This description follows the ${templateEntry ? `${templateEntry.label} · ${templateEntry.variants.find(v => v.variant === templateVariant)?.label || templateVariant}` : 'story'} template`}>
                     <Chip
                       size="small"
                       variant="outlined"
@@ -3399,7 +3528,7 @@ export default function JiraMinator() {
                   </Tooltip>
                 )}
                 {agent.available && (
-                  <Tooltip title="Reshape this description into the story template">
+                  <Tooltip title={`Reshape this description into the ${templateEntry ? templateEntry.label : 'story'} template`}>
                     <span style={{ marginLeft: 'auto' }}>
                       <Button
                         size="small"
@@ -3515,6 +3644,7 @@ export default function JiraMinator() {
                 mode={agent.mode}
                 model={agentModel || agent.model}
                 models={agent.models}
+                template={templateChoice}
                 onModelChange={chooseAgentModel}
                 onApply={applyAgentPatch}
                 onClose={() => setPanels(prev => ({ ...prev, assistant: false }))}
