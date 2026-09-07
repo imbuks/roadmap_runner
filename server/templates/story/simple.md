@@ -2,6 +2,12 @@
 label: Simple
 ---
 
+**Story Title:** <One concise line that becomes the Jira summary>
+**Story Points:** <estimate>
+**Labels:** <comma-separated>
+
+---
+
 ## User Story
 
 **As a** <persona / role>

@@ -62,13 +62,28 @@ function splitFrontmatter(text) {
   return { front, body: text.slice(match[0].length) };
 }
 
+/*
+ * The `**Field:** value` lines a template declares above its first section. They map onto
+ * Jira fields rather than description text, so which ones a format asks for is the
+ * template's business too — a title it does not declare is one no reply can be faulted for
+ * leaving out.
+ */
+function metaFieldNames(body) {
+  const head = String(body).split(/^##\s+/m)[0];
+  const names = [];
+  const line = /^\*\*([^*:]+):\*\*/gm;
+  let m;
+  while ((m = line.exec(head)) !== null) names.push(m[1].trim().toLowerCase());
+  return names;
+}
+
 function parseTemplateText(text) {
   const { front, body } = splitFrontmatter(String(text).replace(/\r\n/g, '\n'));
   const sections = (body.match(/^##[ \t]+(.+)$/gm) || []).map((heading) => {
     const raw = heading.replace(/^##[ \t]+/, '');
     return { name: normalizeSectionName(raw), optional: isOptionalHeading(raw) };
   });
-  return { front, body: body.trim(), sections };
+  return { front, body: body.trim(), sections, fields: metaFieldNames(body) };
 }
 
 /*
@@ -99,6 +114,14 @@ function readTemplateFile(type, variant) {
     isDefault: /^(1|true|yes)$/i.test(parsed.front.default || '') || variant === 'default',
     text: parsed.body,
     sections: parsed.sections,
+    fields: parsed.fields,
+    /*
+     * Which metadata line carries the summary, if this format has one: a story says
+     * `**Story Title:**`, a bug or a task just `**Title:**`. A template that declares
+     * neither is authored with its summary somewhere else, and demanding a title of every
+     * reply would then fail every reply — so this is read off the file, not assumed.
+     */
+    titleField: parsed.fields.find(f => f === 'story title' || f === 'title') || null,
     // Sections that reach Jira, in the template's own order
     published: names.filter(n => !NEVER_PUBLISHED.includes(n)),
     // A section is required unless its heading says `(Optional)`
@@ -177,6 +200,8 @@ const BUILTIN_TEMPLATE = {
   id: 'builtin', type: FALLBACK_TYPE, variant: 'builtin', label: 'Built-in', isDefault: true,
   text: BUILTIN.body,
   sections: BUILTIN.sections,
+  fields: BUILTIN.fields,
+  titleField: 'story title',
   published: BUILTIN.sections.map(s => s.name),
   required: BUILTIN.sections.map(s => s.name)
 };
@@ -262,17 +287,21 @@ function parseStoryDoc(markdown) {
  * and `hard` ones are the ones worth spending a re-ask on. Renumbering and over-long
  * summaries are fixed here rather than bounced back.
  */
-function validateStoryDoc(doc, { requireTitle = true, template } = {}) {
+function validateStoryDoc(doc, { requireTitle, template } = {}) {
   const shape = template || resolveTemplate({});
   const violations = [];
   const hard = [];
 
   /*
    * A whole document from the agent carries its title as a metadata line. A row's
-   * *description* never does — the summary lives in its own field — so demanding one
-   * there would mark every well-formed story as broken.
+   * *description* never does — the summary lives in its own field — so callers say
+   * `requireTitle: false` there, and demanding one would mark every well-formed story as
+   * broken. Left unsaid, the template decides: a format that does not declare a title line
+   * is not asking for one, and faulting a reply for omitting what it was never shown is
+   * how an edit to a template file breaks every answer the model gives.
    */
-  if (requireTitle && !docTitle(doc)) hard.push('No `**Story Title:**` line.');
+  const wantsTitle = requireTitle === undefined ? Boolean(shape.titleField) : requireTitle;
+  if (wantsTitle && !docTitle(doc)) hard.push(`No \`**${titleCase(shape.titleField || 'story title')}:**\` line.`);
 
   /*
    * Which sections must be there, and which may be left out, is the template's business:
@@ -424,6 +453,11 @@ function buildSystemPrompt({ intent = 'refine', template } = {}) {
     '',
     'The document must follow this format exactly:',
     '  - Metadata lines use the exact pattern `**Field:** value`.',
+    // Named outright, not left to the template to imply. A small model that drops the
+    // title costs a whole re-ask, and the re-ask is what says this out loud anyway.
+    shape.titleField
+      ? `  - The \`**${titleCase(shape.titleField)}:**\` line is required; it becomes the Jira summary.`
+      : null,
     `  - Section headers are level-2: ${headings}.`,
     optional.length
       ? `  - Every section is required except ${optional.join(' and ')}, which may be left out.`
@@ -440,7 +474,7 @@ function buildSystemPrompt({ intent = 'refine', template } = {}) {
     '```story',
     shape.text,
     '```'
-  ]).join('\n');
+  ]).filter(line => line !== null).join('\n');
 }
 
 /**
