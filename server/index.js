@@ -164,6 +164,12 @@ const SSO_MESSAGE =
   'cannot satisfy it. Use "Sign in with browser", or connect to the corporate network/VPN ' +
   'where the gateway lets API traffic through.';
 
+// The same wall, met by a session that already signed in through the browser: the advice
+// about tokens and VPNs is beside the point, and signing in again is the only way on.
+const SSO_EXPIRED_MESSAGE =
+  'Your Jira sign-in has expired and signing in again did not get past the network ' +
+  'gateway (F5 BIG-IP). Use "Sign in with browser" to start a fresh session.';
+
 const APM_MESSAGE =
   'Jira is unreachable: the network gateway (F5 BIG-IP) answered instead of Jira. ' +
   'This usually means the VPN/SSO session has expired — reconnect to the VPN, then sign in to Jira again.';
@@ -210,15 +216,40 @@ function gatewayStateFor(jar) {
   return state;
 }
 
+// An 'sso' session sends no Authorization header at all, so drop empty ones rather
+// than letting "Authorization: null" go out on the wire.
+const withoutEmptyHeaders = headers =>
+  Object.fromEntries(Object.entries(headers || {}).filter(([, value]) => value != null));
+
+// Ask a cheap endpoint what, if anything, is standing in front of Jira. Used when a
+// request failed in a way that left no response to classify — a redirect node-fetch
+// would not follow. Unlike priming, it disturbs nothing: no cookies are cleared.
+async function probeInterception(fetchWithCookies, jiraUrl, auth) {
+  try {
+    const response = await fetchWithCookies(`${jiraUrl}/rest/api/2/myself`, {
+      headers: withoutEmptyHeaders({ 'Authorization': buildAuthHeader(auth), 'Accept': 'application/json' }),
+      redirect: 'follow'
+    });
+    return classifyInterception(response, await response.text());
+  } catch (err) {
+    // No answer is not a clean bill of health: treat it as the gateway misbehaving
+    return 'apm';
+  }
+}
+
 // Drop the stale gateway cookies, then send one cheap request on its own so the gateway
 // can run its access policy through to completion without competition. Its own request
 // can lose a race too, so give it a few tries before leaving it to the caller's retry.
+// A browser session keeps its cookies: they are the credential, and clearing them turns
+// a hiccup into a sign-in that could otherwise have been avoided.
 async function primeGatewaySession(jar, fetchWithCookies, jiraUrl, auth) {
-  await new Promise(resolve => jar.removeAllCookies(() => resolve()));
+  if (!auth || auth.authType !== 'sso') {
+    await new Promise(resolve => jar.removeAllCookies(() => resolve()));
+  }
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const response = await fetchWithCookies(`${jiraUrl}/rest/api/2/myself`, {
-        headers: { 'Authorization': buildAuthHeader(auth), 'Accept': 'application/json' },
+        headers: withoutEmptyHeaders({ 'Authorization': buildAuthHeader(auth), 'Accept': 'application/json' }),
         redirect: 'follow'
       });
       const kind = classifyInterception(response, await response.text());
@@ -282,46 +313,96 @@ function makeJiraFetch(jar, jiraUrl, auth) {
   });
 
   const state = gatewayStateFor(jar);
-  // A streamed body (a file upload) cannot be replayed, so such a request is recovered
-  // but not retried here — resending it would send an empty form.
+  // A streamed body (a file upload) cannot be sent twice, so such a request is recovered
+  // but not retried here — resending it would send an empty form. Call sites able to
+  // build a fresh copy pass `newBody` instead, and are retried like anything else.
   const replayable = body => !body || typeof body === 'string' || Buffer.isBuffer(body);
-  // An 'sso' session sends no Authorization header at all, so drop empty ones rather
-  // than letting "Authorization: null" go out on the wire.
-  const withoutEmptyHeaders = headers =>
-    Object.fromEntries(Object.entries(headers || {}).filter(([, value]) => value != null));
 
   return async function jiraFetch(url, options = {}) {
-    const request = { ...options, headers: withoutEmptyHeaders(options.headers) };
+    // `newBody` is a factory returning { body, headers } — a multipart body carries its
+    // own boundary in a Content-Type header, so the two have to be rebuilt together.
+    const { newBody, ...rest } = options;
+    const buildRequest = () => {
+      if (!newBody) return { ...rest, headers: withoutEmptyHeaders(rest.headers) };
+      const fresh = newBody();
+      return {
+        ...rest,
+        body: fresh.body,
+        headers: withoutEmptyHeaders({ ...rest.headers, ...fresh.headers })
+      };
+    };
 
     for (let attempt = 0; ; attempt++) {
       // If the gateway session is already being re-established, wait for it rather than
       // racing it — competing evaluations are exactly what the gateway rejects.
       if (state.recovery) await state.recovery;
       const generation = state.generation;
+      const request = buildRequest();
 
-      const response = await fetchWithCookies(url, request);
+      // A redirect cannot be followed while the body is a stream (fetch-cookie throws, and
+      // the Location is lost with it), so a streamed request takes its redirect by hand.
+      const streamed = !!request.body && typeof request.body.pipe === 'function';
+      const response = await fetchWithCookies(url, streamed ? { ...request, redirect: 'manual' } : request);
       const body = await response.text();
-      const kind = classifyInterception(response, body);
-      if (!kind) return buffered(response, body);
+
+      let kind;
+      if (streamed && response.status >= 300 && response.status < 400) {
+        // Jira answers these calls with JSON and never redirects, so the gateway is the
+        // only thing this can be. Say where it pointed: the query is left out, since a
+        // SAML redirect carries a signed request in it.
+        const location = response.headers.get('location');
+        const target = location ? (u => u.origin + u.pathname)(new URL(location, url)) : '(no Location)';
+        console.warn(`Gateway redirected ${request.method || 'GET'} ${new URL(url).pathname}: ${response.status} → ${target}`);
+        kind = await probeInterception(fetchWithCookies, jiraUrl, auth);
+        // The gateway sometimes bounces a request through its policy check and straight
+        // back. Every other call follows that without noticing; an upload cannot, and the
+        // probe above has just made the trip for it. So the session is fine: send the
+        // upload again rather than re-establishing a session that needs nothing, which
+        // would cost a sign-in for no reason.
+        if (!kind) {
+          if (!newBody) {
+            throw new Error('The network gateway in front of Jira interrupted this upload. Please try again.');
+          }
+          if (attempt >= MAX_GATEWAY_ATTEMPTS) {
+            throw new Error(`The network gateway in front of Jira keeps turning this upload away ` +
+              `(${response.status} → ${target}), although the Jira session itself is working.`);
+          }
+          continue;
+        }
+      } else {
+        kind = classifyInterception(response, body);
+        if (!kind) return buffered(response, body);
+      }
 
       // Only a browser can complete an SSO flow. A session that was established that way
       // can re-open one; anything else has nothing left to try, so report it now rather
       // than spending three rounds of retries arriving at the same wall.
       const canReopenBrowser = auth && auth.authType === 'sso';
       if (kind === 'sso' && !canReopenBrowser) throw new Error(SSO_MESSAGE);
-      if (attempt >= MAX_GATEWAY_ATTEMPTS) throw new Error(kind === 'sso' ? SSO_MESSAGE : APM_MESSAGE);
+      if (attempt >= MAX_GATEWAY_ATTEMPTS) {
+        if (kind !== 'sso') throw new Error(APM_MESSAGE);
+        throw new Error(canReopenBrowser ? SSO_EXPIRED_MESSAGE : SSO_MESSAGE);
+      }
 
-      const recovered = await recoverGatewaySession(state, generation, () =>
-        kind === 'sso'
-          ? reloginWithBrowser(jar, jiraUrl, auth)
-          : primeGatewaySession(jar, fetchWithCookies, jiraUrl, auth));
+      // Whichever failing request gets here first picks the recovery for all of them, and
+      // under a burst one may see the SAML redirect while another sees the gateway's
+      // "evaluation already in progress" page. So a gentle recovery that turns out to be
+      // facing a sign-in escalates to the browser itself — otherwise a browser session
+      // would be told that no token can help, and never be offered a window.
+      const recovered = await recoverGatewaySession(state, generation, async () => {
+        if (kind !== 'sso') {
+          const primed = await primeGatewaySession(jar, fetchWithCookies, jiraUrl, auth);
+          if (primed !== 'sso' || !canReopenBrowser) return primed;
+        }
+        return reloginWithBrowser(jar, jiraUrl, auth);
+      });
 
       if (recovered === 'sso') throw new Error(SSO_MESSAGE);
       // A browser sign-in that failed outright (cancelled, timed out) is the user's
       // answer, so surface it instead of silently retrying.
       if (recovered && recovered.error) throw recovered.error;
 
-      if (!replayable(request.body)) {
+      if (!newBody && !replayable(request.body)) {
         throw new Error('The network gateway in front of Jira ended this session. It has been re-established — please try again.');
       }
     }
@@ -769,33 +850,264 @@ app.post('/api/jira/boards', async (req, res) => {
   }
 });
 
+/**
+ * Pull Jira's own words out of a rejection. The browser only ever sees `error`, so a
+ * planner that says "Jira API error" tells nobody why a sprint would not start — while
+ * Jira itself said something perfectly clear in the body.
+ */
+function jiraErrorMessage(body, fallback = 'Jira API error') {
+  try {
+    const parsed = JSON.parse(body);
+    const messages = [...(parsed.errorMessages || []), ...Object.values(parsed.errors || {})].filter(Boolean);
+    if (messages.length) return messages.join(' ');
+  } catch (err) { /* not JSON — an intercepted response is already handled upstream */ }
+  return fallback;
+}
+
+/**
+ * The agile API pages like the platform one but announces the end differently: some
+ * collections report `isLast`, others only a `total`. Honour both, because a board with
+ * a long history of closed sprints otherwise silently stops at the first page.
+ */
+async function agileGetAll(fetchWithCookies, jiraUrl, authHeader, path, key = 'values') {
+  const collected = [];
+  let startAt = 0;
+  for (;;) {
+    const url = `${jiraUrl}${path}${path.includes('?') ? '&' : '?'}maxResults=50&startAt=${startAt}`;
+    const pageRes = await fetchWithCookies(url, {
+      headers: { 'Authorization': authHeader, 'Accept': 'application/json' },
+      redirect: 'follow'
+    });
+    const pageText = await pageRes.text();
+    if (!pageRes.ok) throw new JiraApiError(pageRes.status, pageText);
+    const page = JSON.parse(pageText);
+    const batch = page[key] || [];
+    collected.push(...batch);
+    startAt += batch.length;
+    if (batch.length === 0 || page.isLast || (page.total != null && startAt >= page.total)) break;
+  }
+  return collected;
+}
+
 app.post('/api/jira/sprints', async (req, res) => {
-  const { sessionId, boardId } = req.body;
+  const { sessionId, boardId, includeClosed } = req.body;
   if (!sessionId || !jiraSessions[sessionId]) {
     return res.status(400).json({ error: 'Invalid or missing Jira session. Please authenticate first.' });
   }
   const { jar, jiraUrl, auth } = jiraSessions[sessionId];
   const fetchWithCookies = makeJiraFetch(jar, jiraUrl, auth);
   try {
-    // Only fetch open sprints (active + future); exclude closed sprints
-    const sprintsUrl = `${jiraUrl}/rest/agile/1.0/board/${boardId}/sprint?state=active,future`;
-    const sprintsRes = await fetchWithCookies(sprintsUrl, {
-      headers: {
-        'Authorization': buildAuthHeader(auth),
-        'Accept': 'application/json'
-      },
+    // Open sprints (active + future) are what planning is about; closed ones are history
+    // and are only fetched when something asks for them.
+    const states = includeClosed ? 'active,future,closed' : 'active,future';
+    const values = await agileGetAll(
+      fetchWithCookies, jiraUrl, buildAuthHeader(auth),
+      `/rest/agile/1.0/board/${boardId}/sprint?state=${states}`
+    );
+    // Guard against instances that ignore the state filter by also excluding closed here
+    const sprints = values
+      .filter(s => includeClosed || s.state !== 'closed')
+      // id/name/state are what the older callers read; the rest is for the planner board
+      .map(s => ({
+        id: s.id,
+        name: s.name,
+        state: s.state,
+        goal: s.goal || '',
+        startDate: s.startDate || null,
+        endDate: s.endDate || null,
+        completeDate: s.completeDate || null,
+        boardId: s.originBoardId != null ? s.originBoardId : boardId
+      }));
+    res.json({ sprints });
+  } catch (err) {
+    if (err instanceof JiraApiError) {
+      return res.status(err.status).json({ error: jiraErrorMessage(err.body), status: err.status, body: err.body });
+    }
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
+/*
+ * --- The sprint planner's board ------------------------------------------------------
+ *
+ * Planning moves whole issues between sprints, which the agile API does directly and the
+ * platform API cannot: writing the Sprint custom field is rejected on some instances and
+ * silently ignored on others. So these four routes speak /rest/agile/1.0 throughout, and
+ * treat the board's backlog as one more column — 'backlog' stands in for a sprint id.
+ */
+const BACKLOG_COLUMN = 'backlog';
+
+// The issues in one sprint, or the board's backlog. Sub-tasks are left out: they follow
+// their parent's sprint in Jira, so showing them would offer a move that cannot be made.
+app.post('/api/jira/sprint-issues', async (req, res) => {
+  const { sessionId, boardId, sprintId } = req.body;
+  if (!sessionId || !jiraSessions[sessionId]) {
+    return res.status(400).json({ error: 'Invalid or missing Jira session. Please authenticate first.' });
+  }
+  if (sprintId == null) {
+    return res.status(400).json({ error: 'A sprintId is required (or "backlog").' });
+  }
+  if (String(sprintId) === BACKLOG_COLUMN && !boardId) {
+    return res.status(400).json({ error: 'A boardId is required to read the backlog.' });
+  }
+  const { jar, jiraUrl, auth } = jiraSessions[sessionId];
+  const fetchWithCookies = makeJiraFetch(jar, jiraUrl, auth);
+  const authHeader = buildAuthHeader(auth);
+  try {
+    const custom = await findTableFields(fetchWithCookies, jiraUrl, authHeader);
+    const path = String(sprintId) === BACKLOG_COLUMN
+      ? `/rest/agile/1.0/board/${encodeURIComponent(boardId)}/backlog`
+      : `/rest/agile/1.0/sprint/${encodeURIComponent(sprintId)}/issue`;
+    const found = await agileGetAll(fetchWithCookies, jiraUrl, authHeader, path, 'issues');
+    const issues = toTableRows(
+      found.filter(issue => !(issue.fields && issue.fields.issuetype && issue.fields.issuetype.subtask)),
+      custom, jiraUrl
+    );
+    res.json({ issues, total: issues.length });
+  } catch (err) {
+    if (err instanceof JiraApiError) {
+      return res.status(err.status).json({ error: jiraErrorMessage(err.body), status: err.status, body: err.body });
+    }
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
+app.post('/api/jira/create-sprint', async (req, res) => {
+  const { sessionId, boardId, name, startDate, endDate, goal } = req.body;
+  if (!sessionId || !jiraSessions[sessionId]) {
+    return res.status(400).json({ error: 'Invalid or missing Jira session. Please authenticate first.' });
+  }
+  if (!boardId) return res.status(400).json({ error: 'A boardId is required to create a sprint.' });
+  if (!name || !name.trim()) return res.status(400).json({ error: 'A sprint name is required.' });
+  const { jar, jiraUrl, auth } = jiraSessions[sessionId];
+  const fetchWithCookies = makeJiraFetch(jar, jiraUrl, auth);
+  const authHeader = buildAuthHeader(auth);
+  try {
+    // Dates and a goal are optional on a future sprint, and Jira rejects empty strings
+    // where it expects a timestamp — so send only what was actually filled in.
+    const body = { name: name.trim(), originBoardId: Number(boardId) };
+    if (startDate) body.startDate = startDate;
+    if (endDate) body.endDate = endDate;
+    if (goal && goal.trim()) body.goal = goal.trim();
+
+    const createRes = await fetchWithCookies(`${jiraUrl}/rest/agile/1.0/sprint`, {
+      method: 'POST',
+      headers: { 'Authorization': authHeader, 'Accept': 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
       redirect: 'follow'
     });
-    const sprintsText = await sprintsRes.text();
-    if (!sprintsRes.ok) {
-      return res.status(sprintsRes.status).json({ error: 'Jira API error', status: sprintsRes.status, body: sprintsText });
+    const createText = await createRes.text();
+    if (!createRes.ok) {
+      return res.status(createRes.status).json({
+        error: jiraErrorMessage(createText, 'Jira would not create the sprint'),
+        status: createRes.status, body: createText
+      });
     }
-    const sprintsData = JSON.parse(sprintsText);
-    // Guard against instances that ignore the state filter by also excluding closed here
-    const sprints = (sprintsData.values || [])
-      .filter(s => s.state !== 'closed')
-      .map(s => ({ id: s.id, name: s.name, state: s.state }));
-    res.json({ sprints });
+    const created = JSON.parse(createText);
+    res.json({
+      sprint: {
+        id: created.id,
+        name: created.name,
+        state: created.state,
+        goal: created.goal || '',
+        startDate: created.startDate || null,
+        endDate: created.endDate || null,
+        completeDate: created.completeDate || null,
+        boardId: created.originBoardId != null ? created.originBoardId : boardId
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
+// Move issues into a sprint, or out to the backlog. Jira takes at most 50 keys per call.
+app.post('/api/jira/move-issues', async (req, res) => {
+  const { sessionId, sprintId, issueKeys } = req.body;
+  if (!sessionId || !jiraSessions[sessionId]) {
+    return res.status(400).json({ error: 'Invalid or missing Jira session. Please authenticate first.' });
+  }
+  const keys = (issueKeys || []).map(k => String(k).trim()).filter(Boolean);
+  if (keys.length === 0) return res.status(400).json({ error: 'At least one issue key is required.' });
+  if (sprintId == null) return res.status(400).json({ error: 'A target sprintId is required (or "backlog").' });
+  const { jar, jiraUrl, auth } = jiraSessions[sessionId];
+  const fetchWithCookies = makeJiraFetch(jar, jiraUrl, auth);
+  const authHeader = buildAuthHeader(auth);
+  const target = String(sprintId) === BACKLOG_COLUMN
+    ? `${jiraUrl}/rest/agile/1.0/backlog/issue`
+    : `${jiraUrl}/rest/agile/1.0/sprint/${encodeURIComponent(sprintId)}/issue`;
+  try {
+    for (let from = 0; from < keys.length; from += 50) {
+      const chunk = keys.slice(from, from + 50);
+      const moveRes = await fetchWithCookies(target, {
+        method: 'POST',
+        headers: { 'Authorization': authHeader, 'Accept': 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ issues: chunk }),
+        redirect: 'follow'
+      });
+      // A successful move returns 204 No Content
+      if (!moveRes.ok) {
+        const moveText = await moveRes.text();
+        return res.status(moveRes.status).json({
+          error: jiraErrorMessage(moveText, 'Jira would not move the issues'),
+          status: moveRes.status, body: moveText, moved: from
+        });
+      }
+    }
+    res.json({ moved: keys.length, sprintId });
+  } catch (err) {
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
+// Start a future sprint or complete an active one. Jira insists on both dates when a
+// sprint starts, so the caller sends them and this route passes them straight through.
+app.post('/api/jira/sprint-state', async (req, res) => {
+  const { sessionId, sprintId, state, startDate, endDate } = req.body;
+  if (!sessionId || !jiraSessions[sessionId]) {
+    return res.status(400).json({ error: 'Invalid or missing Jira session. Please authenticate first.' });
+  }
+  if (!sprintId) return res.status(400).json({ error: 'A sprintId is required.' });
+  if (!['active', 'closed'].includes(state)) {
+    return res.status(400).json({ error: "state must be 'active' (start) or 'closed' (complete)." });
+  }
+  if (state === 'active' && (!startDate || !endDate)) {
+    return res.status(400).json({ error: 'Starting a sprint requires a start and end date.' });
+  }
+  const { jar, jiraUrl, auth } = jiraSessions[sessionId];
+  const fetchWithCookies = makeJiraFetch(jar, jiraUrl, auth);
+  const authHeader = buildAuthHeader(auth);
+  try {
+    const body = { state };
+    if (startDate) body.startDate = startDate;
+    if (endDate) body.endDate = endDate;
+    // POST is a partial update here; PUT would blank every field left out of the body
+    const stateRes = await fetchWithCookies(`${jiraUrl}/rest/agile/1.0/sprint/${encodeURIComponent(sprintId)}`, {
+      method: 'POST',
+      headers: { 'Authorization': authHeader, 'Accept': 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      redirect: 'follow'
+    });
+    const stateText = await stateRes.text();
+    if (!stateRes.ok) {
+      return res.status(stateRes.status).json({
+        error: jiraErrorMessage(stateText, `Jira would not ${state === 'active' ? 'start' : 'complete'} the sprint`),
+        status: stateRes.status, body: stateText
+      });
+    }
+    const updated = JSON.parse(stateText);
+    res.json({
+      sprint: {
+        id: updated.id,
+        name: updated.name,
+        state: updated.state,
+        goal: updated.goal || '',
+        startDate: updated.startDate || null,
+        endDate: updated.endDate || null,
+        completeDate: updated.completeDate || null,
+        boardId: updated.originBoardId != null ? updated.originBoardId : null
+      }
+    });
   } catch (err) {
     res.status(500).json({ error: err.message, stack: err.stack });
   }
@@ -1897,23 +2209,29 @@ app.post('/api/jira/attach', upload.array('files'), async (req, res) => {
   const { jar, jiraUrl, auth } = jiraSessions[sessionId];
   const fetchWithCookies = makeJiraFetch(jar, jiraUrl, auth);
   const authHeader = buildAuthHeader(auth);
-  try {
+  // The files are already buffered in memory, so a fresh multipart body can be built for
+  // every attempt. That is what lets an upload be retried after the gateway in front of
+  // Jira ends the session mid-request — the stream itself could only ever be sent once.
+  const newBody = () => {
     const form = new FormData();
     files.forEach(file => {
       // Multer decodes filenames as latin1; restore the original UTF-8 name
       const filename = Buffer.from(file.originalname, 'latin1').toString('utf8');
       form.append('file', file.buffer, { filename, contentType: file.mimetype });
     });
+    // The boundary lives in these headers, so they belong to this body and no other
+    return { body: form, headers: form.getHeaders() };
+  };
+  try {
     const attachRes = await fetchWithCookies(`${jiraUrl}/rest/api/2/issue/${encodeURIComponent(issueKey)}/attachments`, {
       method: 'POST',
       headers: {
         'Authorization': authHeader,
         'Accept': 'application/json',
         // Required by Jira to allow attachment uploads from a non-form context
-        'X-Atlassian-Token': 'no-check',
-        ...form.getHeaders()
+        'X-Atlassian-Token': 'no-check'
       },
-      body: form,
+      newBody,
       redirect: 'follow'
     });
     const attachText = await attachRes.text();

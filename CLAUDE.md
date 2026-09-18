@@ -43,6 +43,7 @@ in the JSON body, and the proxy holds the credentials and cookie jar.
 | `/` | `App.js` + `Timeline.js` | Excel-driven Gantt roadmap (vis-timeline), rows kept in `localStorage` under `roadmapData` |
 | `/jiraminator` | `JiraMinator.js` | The main workhorse: a DataGrid for authoring, importing, bulk-editing and publishing Jira issues |
 | `/pi-planner` | `PIPlanner.js` | PI planning views over the Feature → Epic → Story hierarchy |
+| `/sprint-planner` | `SprintPlanner.js` | Sprints as buckets or as a list: create sprints, move issues between them, peek at one |
 
 `src/components/SharePointLists.js` is empty.
 
@@ -68,7 +69,18 @@ status codes. Consequences that shape the server:
   + generation counter, so a burst of failing requests produces **one** recovery, not one each —
   critical because the gateway rejects concurrent policy evaluations, and because for `sso` a
   recovery means opening a browser window.
-- Non-replayable bodies (file uploads) are recovered but not retried; the caller is told to try again.
+- A streamed body (a file upload) can only be sent once, and a redirect cannot be followed while
+  one is in flight — so the attach route hands `jiraFetch` a `newBody` factory instead of a `body`,
+  and the multipart form (with its boundary headers) is rebuilt for each attempt. A streamed
+  request takes its redirects by hand (`redirect: 'manual'`), logs where the gateway sent it,
+  and asks `probeInterception` what is in the way. The gateway sometimes bounces a request
+  through `/my.policy` and straight back, which every other call follows without noticing — so
+  when the probe finds the session fine, the upload is simply sent again, with no recovery at
+  all. A call site that passes a plain stream is still recovered but not retried; the caller is
+  told to try again.
+- Recovery never clears a browser session's cookies (they are the credential), and when the
+  gentle `apm` recovery finds a sign-in page in the way, an `sso` session escalates to the
+  browser rather than failing with the token-oriented message.
 - `server/browser-login.js` drives Playwright Chromium against a persistent profile
   (`~/.roadmap-runner/browser-profile`, or `ROADMAP_BROWSER_PROFILE`) so the IdP remembers the user
   and re-sign-in is usually silent. It also clears stale `SingletonLock` files.
@@ -172,6 +184,63 @@ scroll that clamps to the top and looks like a jump list that does nothing.
 
 One undo, in the dialog footer, for the last applied change from either Magic Format or the
 assistant. The chat bubble deliberately does not carry its own: it scrolls out of sight.
+
+### The sprint planner
+
+A column per sprint plus one for the backlog, issues moved between them, and a peek panel
+for the issue under the cursor. The same sprints are shown two ways — a **bucket view** of
+draggable columns and a **list view**, one table with a section per sprint, chosen from the
+title bar and remembered in `localStorage` under `sprintPlannerView`. They share their data,
+their filters and the peek; what dragging does on the board, the Sprint cell on each row does
+in the list, through the same `moveIssue`. Five routes back it, and they speak `/rest/agile/1.0`
+throughout rather than the platform API that the rest of the server uses: writing the Sprint
+custom field to move an issue is rejected on some instances and silently ignored on others,
+while `POST /sprint/{id}/issue` is the operation Jira actually means. `sprint-issues`,
+`create-sprint`, `move-issues` and `sprint-state` are new; `sprints` grew an `includeClosed`
+flag and now carries dates and the goal alongside the `{id, name, state}` its older callers read.
+
+- **The backlog is a column.** `'backlog'` stands in for a sprint id everywhere — the client
+  sends it, `sprint-issues` reads `/board/{id}/backlog` for it and `move-issues` posts to
+  `/backlog/issue`. One code path covers "into a sprint" and "out of every sprint".
+- **Sub-tasks are left out** of a sprint's issues. They follow their parent's sprint in Jira,
+  so a card for one would offer a move that cannot be made.
+- `agileGetAll` honours both of the agile API's ways of announcing the last page (`isLast` on
+  some collections, only a `total` on others) — a board with a long history of closed sprints
+  otherwise stops silently at the first fifty.
+- **A move is optimistic**, and a rejection puts the card back where it came from. The row
+  being moved is read out of state *before* the update rather than inside the updater: React
+  runs an updater on its own schedule, so a variable it assigns is not there yet on the next
+  line — and the board would move the card while never telling Jira.
+- Columns load a few at a time (`forEachWithLimit`), because each one is its own request and
+  the gateway is happier with four than with a dozen.
+- The planner's routes report **Jira's own words** on a rejection (`jiraErrorMessage` digs
+  `errorMessages` out of the body): the browser only ever sees `error`, and "Jira API error"
+  tells nobody why a sprint would not start.
+- The peek edits through the same `update-story` path the grid publishes with, so the field
+  mapping stays in one place. Moving is the exception — it happens on the spot through
+  `move-issues`, not on save, since that is what dragging the card does too.
+- **Filtering is by person as well as by text.** The assignee list is built from who actually
+  holds an issue on this board rather than from the project's assignable users, since that is
+  both shorter and the only list that can narrow anything. A column's points follow the filter
+  — filtering to one person is how you find out what that person is carrying.
+
+[src/utils/sprintPlan.js](src/utils/sprintPlan.js) is what the create dialog opens on, and it
+is deliberately a separate module: it is pure arithmetic over the sprints a board already has,
+and the only part of this page that can be checked without a browser.
+
+- **The cadence is read, not assumed.** `inferCadenceDays` takes the *median* span of dated
+  sprints, so one sprint left open for three months does not stretch every sprint planned
+  after it; spans outside 1–90 days teach nothing and are ignored. Two weeks is the fallback
+  for a board with nothing dated. The same number prefills the Start-sprint dialog.
+- **The name is the next one in the series.** The trailing number counts up, zero padding and
+  any suffix kept — `Sprint 24` → `Sprint 25`, `PI 2025.3 S2` → `PI 2025.3 S3` — skipping
+  names already taken.
+- **A new sprint starts when the last one ends**, which is what keeps a cadence unbroken. When
+  the last sprint has already finished there is a gap rather than a chain, so it starts at the
+  next occurrence of the weekday and hour the team usually starts on.
+- The dialog says in words what it worked out and from where, because a guess that cannot be
+  seen cannot be disagreed with. Moving the start carries the end with it: the cycle length is
+  the thing being preserved.
 
 ### Descriptions
 

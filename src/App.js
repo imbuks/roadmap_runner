@@ -37,6 +37,7 @@ import "./styles/Timeline.css";
 import { BrowserRouter as Router, Routes, Route, Link, Navigate, useLocation } from 'react-router-dom';
 import JiraMinator from './components/JiraMinator';
 import PIPlanner from './components/PIPlanner';
+import SprintPlanner from './components/SprintPlanner';
 import { debug } from './utils/debug';
 
 function parseCsvDate(dateStr) {
@@ -104,7 +105,8 @@ function generateCapabilitiesFromData(rows) {
 const PAGE_TITLES = [
   { path: '/jiraminator', label: 'JiraMinator', accent: 'Minator' },
   { path: '/jira-stories', label: 'JiraMinator', accent: 'Minator' },
-  { path: '/pi-planner', label: 'PI Planner' }
+  { path: '/pi-planner', label: 'PI Planner' },
+  { path: '/sprint-planner', label: 'Sprint Planner' }
 ];
 const HOME_TITLE = { path: '/', label: 'Roadmap Runner' };
 
@@ -140,6 +142,7 @@ function AppHeader() {
           <MuiMenuItem component={Link} to="/" onClick={closeMenu}>Roadmap Runner</MuiMenuItem>
           <MuiMenuItem component={Link} to="/jiraminator" onClick={closeMenu}>JiraMinator</MuiMenuItem>
           <MuiMenuItem component={Link} to="/pi-planner" onClick={closeMenu}>PI Planner</MuiMenuItem>
+          <MuiMenuItem component={Link} to="/sprint-planner" onClick={closeMenu}>Sprint Planner</MuiMenuItem>
         </Menu>
         {/* Jira connection state and sign-in live here rather than on each page */}
         <JiraAuthAvatar />
@@ -645,6 +648,7 @@ function App() {
           {/* Keep old bookmarks working after the rename */}
           <Route path="/jira-stories" element={<Navigate to="/jiraminator" replace />} />
           <Route path="/pi-planner" element={<PIPlanner />} />
+          <Route path="/sprint-planner" element={<SprintPlanner />} />
           <Route path="/" element={
             <>
               <Box sx={{ width: '100%' }}>
