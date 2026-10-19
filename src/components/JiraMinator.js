@@ -6,7 +6,7 @@ import {
   FilterPanelTrigger,
   GridToolbarQuickFilter
 } from '@mui/x-data-grid';
-import { Button, Box, TextField, Dialog, DialogTitle, DialogContent, DialogActions, Menu, MenuItem, Checkbox, FormControlLabel, CircularProgress, Alert, Typography, IconButton, Tooltip, Chip, Snackbar, Link, ToggleButton, ToggleButtonGroup } from '@mui/material';
+import { Button, Box, TextField, Dialog, DialogTitle, DialogContent, DialogActions, Menu, MenuItem, Checkbox, FormControlLabel, CircularProgress, Alert, Typography, IconButton, Tooltip, Chip, Snackbar, Link, ToggleButton, ToggleButtonGroup, Drawer } from '@mui/material';
 import Autocomplete, { createFilterOptions } from '@mui/material/Autocomplete';
 import { useTheme } from '@mui/material/styles';
 import useMediaQuery from '@mui/material/useMediaQuery';
@@ -545,7 +545,12 @@ export default function JiraMinator() {
       .then(res => res.json())
       .then(data => {
         const models = Array.isArray(data.models) ? data.models : [];
-        setAgent({ available: Boolean(data.available), mode: data.mode, model: data.model, models });
+        setAgent({
+          available: Boolean(data.available), mode: data.mode, model: data.model, models,
+          // Whether the brainstorm can take images, and (Ollama only) which models can read them
+          images: Boolean(data.images),
+          visionModels: Array.isArray(data.visionModels) ? data.visionModels : null
+        });
         // A remembered choice only survives while that model is still installed; otherwise
         // the picker would open on a name every request then fails on.
         let remembered = '';
@@ -554,6 +559,10 @@ export default function JiraMinator() {
       })
       .catch(() => setAgent({ available: false, mode: null, models: [] }));
   }, []);
+
+  // The page-level assistant's drawer. The chat stays mounted while it is closed, so a
+  // brainstorm survives stepping away to look at the table it has been filling.
+  const [brainstormOpen, setBrainstormOpen] = useState(false);
 
   const chooseAgentModel = (name) => {
     setAgentModel(name);
@@ -1668,6 +1677,12 @@ export default function JiraMinator() {
     [newRow.issueType, templateVariant]
   );
 
+  // A brainstorm proposes stories, in whichever story variant this person last chose
+  const brainstormTemplate = useMemo(
+    () => ({ issueType: 'Story', templateVariant: templateVariants.story || '' }),
+    [templateVariants.story]
+  );
+
   /*
    * Where the description stands against the template, kept current as you type.
    * Costs nothing — the check is pure parsing on the server, no model — so it can run
@@ -1752,6 +1767,44 @@ export default function JiraMinator() {
     if (!fromRow) setFormatUndo(previous);
     else setFormatUndo(null);
     return previous;
+  };
+
+  /*
+   * A split from the assistant: each story becomes a row of its own in the table, drafted
+   * rather than published. They inherit where the story being split lives — epic, team,
+   * sprint, CI, people — since a split does not move the work anywhere, and take only the
+   * authored fields from the agent, which is all the server lets through anyway.
+   */
+  const inheritFromRow = (row) => ({
+    issueType: row.issueType,
+    issueTypeIcon: row.issueTypeIcon,
+    team: row.team,
+    teamName: row.teamName,
+    epicLink: row.epicLink,
+    applicationCI: row.applicationCI,
+    sprint: row.sprint,
+    reporter: row.reporter,
+    reporterName: row.reporterName,
+    assignee: row.assignee,
+    assigneeName: row.assigneeName,
+    descriptionFormat: row.descriptionFormat
+  });
+  // The page-level brainstorm has no row to inherit from: its stories start as fresh drafts
+  const addAgentStories = (stories, inherited = inheritFromRow(newRow)) => {
+    if (!stories || stories.length === 0) return;
+    const base = { ...emptyRow(currentUser.key, currentUser.name), ...inherited };
+    setRows(prev => {
+      const nextId = prev.length > 0 ? Math.max(...prev.map(r => r.id)) + 1 : 1;
+      return [...prev, ...stories.map((story, i) => ({
+        ...base,
+        ...story,
+        description: base.descriptionFormat === 'jira'
+          ? markdownToJira(story.description || '')
+          : (story.description || ''),
+        id: nextId + i
+      }))];
+    });
+    setFormatNote(`Added ${stories.length} ${stories.length === 1 ? 'story' : 'stories'} to the table.`);
   };
 
   /*
@@ -2511,6 +2564,15 @@ export default function JiraMinator() {
         <Button variant="contained" onClick={handleOpenCreate}>
           Create Issue
         </Button>
+        {agent.available && (
+          <Button
+            variant="outlined"
+            startIcon={<AutoAwesomeIcon />}
+            onClick={() => setBrainstormOpen(open => !open)}
+          >
+            Brainstorm
+          </Button>
+        )}
         <Button
           variant="outlined"
           startIcon={<ContentCopyIcon />}
@@ -2582,6 +2644,30 @@ export default function JiraMinator() {
           </MenuItem>
         </Menu>
       </Box>
+      {/* Persistent rather than modal, so the table stays usable beside it and the stories
+          it adds can be watched arriving */}
+      {agent.available && (
+        <Drawer
+          anchor="right"
+          variant="persistent"
+          open={brainstormOpen}
+          slotProps={{ paper: { sx: { width: { xs: '100%', sm: 440 }, boxShadow: 6 } } }}
+        >
+          <StoryChat
+            intent="brainstorm"
+            context={{ projectKey: selectedProject ? selectedProject.key : '' }}
+            mode={agent.mode}
+            model={agentModel || agent.model}
+            models={agent.models}
+            template={brainstormTemplate}
+            allowImages={Boolean(agent.images)}
+            visionModels={agent.visionModels || null}
+            onModelChange={chooseAgentModel}
+            onAddStories={stories => addAgentStories(stories, {})}
+            onClose={() => setBrainstormOpen(false)}
+          />
+        </Drawer>
+      )}
       {/* Triggered by the toolbar's import button */}
       <input type="file" accept=".csv" hidden ref={importInputRef} onChange={handleImportCSV} />
       {/* Connection state itself is the app bar avatar; only real failures get a banner */}
@@ -3647,6 +3733,7 @@ export default function JiraMinator() {
                 template={templateChoice}
                 onModelChange={chooseAgentModel}
                 onApply={applyAgentPatch}
+                onAddStories={stories => addAgentStories(stories)}
                 onClose={() => setPanels(prev => ({ ...prev, assistant: false }))}
               />
             </Box>

@@ -15,6 +15,8 @@ const os = require('os');
 const path = require('path');
 const { loginWithBrowser } = require('./browser-login');
 const { registerAgentRoutes } = require('./agent');
+const { registerConfluenceRoutes } = require('./confluence');
+const { registerCredentialRoutes, tokenFor, afterSignIn, NOT_SAVED } = require('./credentials');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -29,6 +31,10 @@ const debug = DEBUG ? (...args) => console.log(...args) : () => {};
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
 
 app.use(cors());
+// The agent's brainstorm carries images inline, as data URLs, which the default 100kb would
+// refuse. Mounted first and on that prefix only: body-parser skips a body already parsed,
+// so every other route keeps the default limit.
+app.use('/api/agent', express.json({ limit: '25mb' }));
 app.use(express.json());
 
 // Session store: { [sessionId]: { jar, jiraUrl, auth, createdAt } }
@@ -216,6 +222,17 @@ function gatewayStateFor(jar) {
   return state;
 }
 
+// The session store holds Confluence sessions too (auth.product === 'confluence'; see
+// server/confluence.js). Everything that asks the gateway "is the session alive" goes
+// through the product's own who-am-I endpoint — Confluence has no /rest/api/2/myself, and
+// its error page for one would read as an interception — and its messages name the right
+// product.
+const IDENTITY_PATHS = { jira: '/rest/api/2/myself', confluence: '/rest/api/user/current' };
+const identityPath = auth => IDENTITY_PATHS[auth && auth.product] || IDENTITY_PATHS.jira;
+const productName = auth => (auth && auth.product === 'confluence' ? 'Confluence' : 'Jira');
+const forProduct = (message, auth) =>
+  productName(auth) === 'Jira' ? message : message.replace(/\bJira\b/g, productName(auth));
+
 // An 'sso' session sends no Authorization header at all, so drop empty ones rather
 // than letting "Authorization: null" go out on the wire.
 const withoutEmptyHeaders = headers =>
@@ -226,7 +243,7 @@ const withoutEmptyHeaders = headers =>
 // would not follow. Unlike priming, it disturbs nothing: no cookies are cleared.
 async function probeInterception(fetchWithCookies, jiraUrl, auth) {
   try {
-    const response = await fetchWithCookies(`${jiraUrl}/rest/api/2/myself`, {
+    const response = await fetchWithCookies(`${jiraUrl}${identityPath(auth)}`, {
       headers: withoutEmptyHeaders({ 'Authorization': buildAuthHeader(auth), 'Accept': 'application/json' }),
       redirect: 'follow'
     });
@@ -248,7 +265,7 @@ async function primeGatewaySession(jar, fetchWithCookies, jiraUrl, auth) {
   }
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const response = await fetchWithCookies(`${jiraUrl}/rest/api/2/myself`, {
+      const response = await fetchWithCookies(`${jiraUrl}${identityPath(auth)}`, {
         headers: withoutEmptyHeaders({ 'Authorization': buildAuthHeader(auth), 'Accept': 'application/json' }),
         redirect: 'follow'
       });
@@ -289,10 +306,12 @@ async function recoverGatewaySession(state, generation, work) {
 async function reloginWithBrowser(jar, jiraUrl, auth) {
   const summary = await loginWithBrowser(jiraUrl, jar, {
     authHeader: buildAuthHeader(auth),
+    identityPath: identityPath(auth),
+    siteName: productName(auth),
     onProgress: where => console.log(`  browser sign-in is at: ${where}`)
   });
   saveSessions(); // the refreshed cookies are the credential; keep them across restarts
-  console.log(`Re-established the Jira browser session for ${summary.user}`);
+  console.log(`Re-established the ${productName(auth)} browser session for ${summary.user}`);
   return summary;
 }
 
@@ -361,11 +380,11 @@ function makeJiraFetch(jar, jiraUrl, auth) {
         // would cost a sign-in for no reason.
         if (!kind) {
           if (!newBody) {
-            throw new Error('The network gateway in front of Jira interrupted this upload. Please try again.');
+            throw new Error(forProduct('The network gateway in front of Jira interrupted this upload. Please try again.', auth));
           }
           if (attempt >= MAX_GATEWAY_ATTEMPTS) {
-            throw new Error(`The network gateway in front of Jira keeps turning this upload away ` +
-              `(${response.status} → ${target}), although the Jira session itself is working.`);
+            throw new Error(forProduct(`The network gateway in front of Jira keeps turning this upload away ` +
+              `(${response.status} → ${target}), although the Jira session itself is working.`, auth));
           }
           continue;
         }
@@ -378,10 +397,10 @@ function makeJiraFetch(jar, jiraUrl, auth) {
       // can re-open one; anything else has nothing left to try, so report it now rather
       // than spending three rounds of retries arriving at the same wall.
       const canReopenBrowser = auth && auth.authType === 'sso';
-      if (kind === 'sso' && !canReopenBrowser) throw new Error(SSO_MESSAGE);
+      if (kind === 'sso' && !canReopenBrowser) throw new Error(forProduct(SSO_MESSAGE, auth));
       if (attempt >= MAX_GATEWAY_ATTEMPTS) {
-        if (kind !== 'sso') throw new Error(APM_MESSAGE);
-        throw new Error(canReopenBrowser ? SSO_EXPIRED_MESSAGE : SSO_MESSAGE);
+        if (kind !== 'sso') throw new Error(forProduct(APM_MESSAGE, auth));
+        throw new Error(forProduct(canReopenBrowser ? SSO_EXPIRED_MESSAGE : SSO_MESSAGE, auth));
       }
 
       // Whichever failing request gets here first picks the recovery for all of them, and
@@ -397,13 +416,13 @@ function makeJiraFetch(jar, jiraUrl, auth) {
         return reloginWithBrowser(jar, jiraUrl, auth);
       });
 
-      if (recovered === 'sso') throw new Error(SSO_MESSAGE);
+      if (recovered === 'sso') throw new Error(forProduct(SSO_MESSAGE, auth));
       // A browser sign-in that failed outright (cancelled, timed out) is the user's
       // answer, so surface it instead of silently retrying.
       if (recovered && recovered.error) throw recovered.error;
 
       if (!newBody && !replayable(request.body)) {
-        throw new Error('The network gateway in front of Jira ended this session. It has been re-established — please try again.');
+        throw new Error(forProduct('The network gateway in front of Jira ended this session. It has been re-established — please try again.', auth));
       }
     }
   };
@@ -442,12 +461,12 @@ async function keepSessionsAlive() {
       const headers = { 'Accept': 'application/json' };
       const authHeader = buildAuthHeader(session.auth);
       if (authHeader) headers.Authorization = authHeader;
-      const response = await fetchCookie(fetch, session.jar)(`${session.jiraUrl}/rest/api/2/myself`, {
+      const response = await fetchCookie(fetch, session.jar)(`${session.jiraUrl}${identityPath(session.auth)}`, {
         headers,
         redirect: 'follow'
       });
       if (classifyInterception(response, await response.text())) {
-        console.log(`Jira session ${id.slice(0, 8)}… has lapsed; the next request will ask for a new sign-in.`);
+        console.log(`${productName(session.auth)} session ${id.slice(0, 8)}… has lapsed; the next request will ask for a new sign-in.`);
       } else {
         refreshed++;
       }
@@ -465,6 +484,11 @@ setInterval(keepSessionsAlive, KEEPALIVE_INTERVAL_MS);
 // session is worth keeping warm above.
 app.use('/api/jira', (req, res, next) => {
   const session = req.body && jiraSessions[req.body.sessionId];
+  // A Confluence session shares the store but would only send Jira paths to Confluence.
+  // Answer as for an unknown session, which is what it is to every route below.
+  if (session && session.auth && session.auth.product === 'confluence') {
+    return res.status(400).json({ error: 'Invalid or missing Jira session. Please authenticate first.' });
+  }
   if (session) session.lastUsedAt = Date.now();
   next();
 });
@@ -483,7 +507,14 @@ app.get('/api/sign-in-viewer', (req, res) => {
 });
 
 app.post('/api/jira/auth', async (req, res) => {
-  const { jiraUrl, jiraUser, jiraToken, authType = 'basic' } = req.body;
+  const { jiraUrl, jiraUser, authType = 'basic' } = req.body;
+  // Only a PAT can be saved (see server/credentials.js); a password is always typed
+  const jiraToken = authType === 'pat'
+    ? tokenFor('jira', jiraUrl, { ...req.body, token: req.body.jiraToken })
+    : req.body.jiraToken;
+  if (authType === 'pat' && !jiraToken && req.body.useSaved) {
+    return res.status(400).json({ error: NOT_SAVED, code: 'no-saved-token' });
+  }
   // PAT auth identifies the user by the token itself, so a username is not required.
   const missingUser = authType !== 'pat' && !jiraUser;
   if (!jiraUrl || !jiraToken || missingUser) {
@@ -510,6 +541,7 @@ app.post('/api/jira/auth', async (req, res) => {
     const sessionId = uuidv4();
     jiraSessions[sessionId] = { jar, jiraUrl, auth, createdAt: Date.now(), lastUsedAt: Date.now() };
     saveSessions();
+    if (authType === 'pat') afterSignIn('jira', jiraUrl, req.body, jiraToken);
     res.json({ sessionId });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -523,7 +555,9 @@ app.post('/api/jira/auth', async (req, res) => {
 // This blocks for as long as the user takes to get through the identity provider, which
 // is why the client has to be willing to wait rather than time the request out.
 app.post('/api/jira/sso-login', async (req, res) => {
-  const { jiraUrl, jiraToken } = req.body;
+  const { jiraUrl } = req.body;
+  // The token is optional here; a saved one stands in for a blank field
+  const jiraToken = tokenFor('jira', jiraUrl, { ...req.body, token: req.body.jiraToken });
   if (!jiraUrl) {
     return res.status(400).json({ error: 'Missing Jira URL' });
   }
@@ -555,6 +589,7 @@ app.post('/api/jira/sso-login', async (req, res) => {
     jiraSessions[sessionId] = { jar, jiraUrl, auth, createdAt: Date.now(), lastUsedAt: Date.now() };
     saveSessions();
     console.log(`Browser sign-in established a Jira session for ${summary.user} (${summary.cookies.join(', ')})`);
+    if (jiraToken) afterSignIn('jira', jiraUrl, req.body, jiraToken);
     // The session is worth keeping even if the client hung up mid-sign-in: it was earned,
     // and it is restored by id like any other. Only the reply has nowhere left to go.
     if (!res.writableEnded) res.json({ sessionId, user: summary.user });
@@ -2248,6 +2283,15 @@ app.post('/api/jira/attach', upload.array('files'), async (req, res) => {
 // The story-refinement agent. Not under /api/jira: it needs no Jira session, and the
 // keepalive middleware on that prefix has nothing to do for it.
 registerAgentRoutes(app);
+registerCredentialRoutes(app);
+registerConfluenceRoutes(app, {
+  sessions: jiraSessions,
+  saveSessions,
+  makeFetch: makeJiraFetch,
+  buildAuthHeader,
+  loginWithBrowser,
+  upload
+});
 
 // Serve the built UI from this same origin, which is how the Docker image runs: one
 // published port covers both the app and the proxy, and the browser needs no CORS hop.

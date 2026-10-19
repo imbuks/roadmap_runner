@@ -264,9 +264,22 @@ function parseStoryDoc(markdown) {
     sections[normalizeSectionName(parts[i])] = trimRules(parts[i + 1]);
   }
 
-  // Acceptance criteria are level-3 `### ACn: title` headings inside their section
+  /*
+   * Acceptance criteria are level-3 `### ACn: title` headings inside their section. A small
+   * model writes the same heading a dozen other ways — `#### AC1`, `**AC1:** title`,
+   * `AC 1 - title` — and those are rewritten into shape here rather than bounced back for
+   * a re-ask: the criterion is plainly there, only its heading is spelled wrong.
+   */
   const criteria = [];
-  const acBlock = sections[CRITERIA_SECTION] || '';
+  let respelled = 0;
+  const acBlock = (sections[CRITERIA_SECTION] || '').replace(
+    /^[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*|__)?[ \t]*AC[ \t]*(\d+)[ \t]*(?:[:.)\-–—][ \t]*)?(?:\*\*|__)?[ \t]*(?:[:.\-–—][ \t]*)?(.*?)[ \t]*(?:\*\*|__)?[ \t]*$/gm,
+    (line, n, title) => {
+      const canonical = `### AC${n}: ${title}`;
+      if (line.trim() !== canonical.trim()) respelled += 1;
+      return canonical;
+    }
+  );
   const acParts = acBlock.split(/^###[ \t]+AC(\d+)[ \t]*:[ \t]*(.*)$/m);
   for (let i = 1; i < acParts.length; i += 3) {
     criteria.push({
@@ -278,7 +291,7 @@ function parseStoryDoc(markdown) {
   // A heading that is not in `### ACn: title` shape would otherwise vanish silently
   const strayHeadings = (acBlock.match(/^###[ \t]+(?!AC\d+[ \t]*:).*$/gm) || []).length;
 
-  return { meta, sections, criteria, strayHeadings };
+  return { meta, sections, criteria, strayHeadings, respelled };
 }
 
 /**
@@ -336,6 +349,9 @@ function validateStoryDoc(doc, { requireTitle, template } = {}) {
   const outOfOrder = doc.criteria.some((c, i) => c.number !== i + 1);
   if (outOfOrder) {
     violations.push('Acceptance criteria were not numbered AC1..ACn in order; renumbered.');
+  }
+  if (doc.respelled) {
+    violations.push(`${doc.respelled} acceptance criteri${doc.respelled === 1 ? 'on heading was' : 'a headings were'} not in \`### ACn: title\` form; rewritten.`);
     doc.criteria.forEach((c, i) => { c.number = i + 1; });
   }
 
@@ -439,7 +455,24 @@ function buildSystemPrompt({ intent = 'refine', template } = {}) {
       'An empty **As a** or a criterion with no Given/When/Then is a failed answer, worse',
       'than one that commits to a reasonable reading of what the author meant.'
     ]
-    : [`You help refine a single Jira ${noun}.`];
+    : intent === 'brainstorm'
+      ? [
+        `You help a delivery team turn an idea, a feature or a rough requirement into Jira ${noun}`,
+        'items that are each independently deliverable and small enough for one sprint. When the',
+        'idea is too vague to break down sensibly, ask the one or two questions that matter and',
+        `propose nothing yet. Otherwise propose the ${noun} items, one complete document each,`,
+        'and say in the note how you divided the work and what you left out. A feature usually',
+        `breaks into three to six ${noun} items; propose a single one only when the idea really`,
+        'is that small, and never fold separate capabilities into one to keep the answer short.',
+        '',
+        'The person may attach images: screenshots, mockups, whiteboard photos, diagrams. Treat',
+        'what they show as part of the idea, and say in the note what you took from them.',
+        '',
+        `When asked to change the ${noun} items you proposed, send the WHOLE revised set again —`,
+        'every item, each complete, including the ones you did not change. What you send',
+        'replaces the previous set, so an item you leave out is an item dropped.'
+      ]
+      : [`You help refine a single Jira ${noun}.`];
 
   const headings = shape.sections.map(s => `\`## ${s.name}\``).join(', ');
   const optional = shape.sections.filter(s => s.optional).map(s => s.name);
@@ -465,6 +498,9 @@ function buildSystemPrompt({ intent = 'refine', template } = {}) {
     `  - Every acceptance criterion is a level-3 heading \`### ACn: <title>\`, numbered from AC1 in order,`,
     '    with its Given/When/Then body directly underneath.',
     '  - Always emit the whole document, not a diff or an excerpt.',
+    '',
+    `If asked to split the ${noun} into smaller ones, reply with one complete fenced \`\`\`story`,
+    `block per resulting ${noun}, each with its own title line, and nothing else fenced.`,
     '',
     'Leave `**Epic:**`, `**Priority:**` and `**Status:**` alone — a human sets those.',
     'Never invent Jira issue keys, team names or sprint names.',
@@ -500,8 +536,45 @@ function checkConformance(markdown, template) {
  * Models label the block inconsistently, so accept the usual spellings and fall back to
  * treating the whole reply as a document when it plainly is one.
  */
+/*
+ * Several stories in one reply, found by their title lines rather than by their fences.
+ *
+ * Fences cannot be trusted once there is more than one story: a model will fence the first
+ * properly, give the second only a closing fence and the rest none, or put them all in one
+ * block. Pairing fences blindly then drops stories without a word, or cuts one off before
+ * its criteria. A title line is the one thing every story starts with (every template puts
+ * it first), so each story runs from its title to the next — ending early at any fence
+ * line, since a story's own text has none and what follows a closing fence is prose.
+ */
+const TITLE_LINE = /^[ \t]*\*\*(?:Story )?Title:\*\*/i;
+const FENCE_LINE = /^[ \t]*```/;
+
+function splitByTitles(raw) {
+  const lines = raw.replace(/\r\n/g, '\n').split('\n');
+  const starts = lines.reduce((acc, line, i) => (TITLE_LINE.test(line) ? [...acc, i] : acc), []);
+  if (starts.length < 2) return null;
+
+  const documents = [];
+  const prose = lines.slice(0, starts[0]);
+  starts.forEach((start, n) => {
+    const end = n + 1 < starts.length ? starts[n + 1] : lines.length;
+    const segment = lines.slice(start, end);
+    const fence = segment.findIndex((line, i) => i > 0 && FENCE_LINE.test(line));
+    const body = fence === -1 ? segment : segment.slice(0, fence);
+    documents.push(body.join('\n').replace(/\n[ \t]*(?:-{3,}|\*{3,})[ \t]*\s*$/, '').trim());
+    if (fence !== -1) prose.push(...segment.slice(fence));
+  });
+  return {
+    prose: prose.filter(line => !FENCE_LINE.test(line)).join('\n').replace(/\n{3,}/g, '\n\n').trim(),
+    documents
+  };
+}
+
 function splitReply(text) {
   const raw = String(text || '');
+  const several = splitByTitles(raw);
+  if (several) return { prose: several.prose, document: several.documents[several.documents.length - 1], documents: several.documents };
+
   const fence = /```(?:story|markdown|md)?\s*\n([\s\S]*?)```/g;
   const blocks = [];
   let m;
@@ -509,13 +582,13 @@ function splitReply(text) {
 
   // The last block is the document; earlier ones are usually examples in the prose
   const titled = /\*\*(?:Story )?Title:\*\*/i;
-  const doc = blocks.reverse().find(b => titled.test(b) || /^##\s+/m.test(b));
+  const doc = [...blocks].reverse().find(b => titled.test(b) || /^##\s+/m.test(b));
   if (doc) {
     const prose = raw.replace(/```(?:story|markdown|md)?\s*\n[\s\S]*?```/g, '').trim();
-    return { prose, document: doc };
+    return { prose, document: doc, documents: [doc] };
   }
-  if (titled.test(raw)) return { prose: '', document: raw };
-  return { prose: raw.trim(), document: null };
+  if (titled.test(raw)) return { prose: '', document: raw, documents: [raw] };
+  return { prose: raw.trim(), document: null, documents: [] };
 }
 
 module.exports = {

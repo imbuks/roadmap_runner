@@ -1400,7 +1400,7 @@ export default function PIPlanner() {
         <DialogContent>
           {!jiraSessionId ? (
             <Alert severity="warning" sx={{ mb: 2 }}>
-              Please authenticate with Jira first using the JiraMinator section.
+              Connect to Jira first, from Connections in the top right.
             </Alert>
           ) : (
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3, mt: 1 }}>

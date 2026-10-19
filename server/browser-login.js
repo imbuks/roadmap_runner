@@ -157,6 +157,9 @@ function looksLikeJira(pages, origin) {
   });
 }
 
+// Who-am-I endpoint the sign-in polls. Confluence passes its own (/rest/api/user/current).
+const JIRA_IDENTITY_PATH = '/rest/api/2/myself';
+
 /**
  * Ask Jira who we are, using the browser context's own cookies but WITHOUT navigating
  * any visible page — the user may be part-way through an MFA prompt, and stealing the
@@ -167,17 +170,19 @@ function looksLikeJira(pages, origin) {
  * token satisfies Jira. Sending both means that as soon as the gateway lets us through,
  * Jira answers — no need to wait for the user to log into Jira as well.
  */
-async function probeIdentity(context, jiraUrl, authHeader) {
+async function probeIdentity(context, jiraUrl, authHeader, identityPath = JIRA_IDENTITY_PATH) {
   try {
     const headers = { Accept: 'application/json' };
     if (authHeader) headers.Authorization = authHeader;
-    const response = await context.request.get(`${jiraUrl}/rest/api/2/myself`, {
+    const response = await context.request.get(`${jiraUrl}${identityPath}`, {
       headers,
       failOnStatusCode: false,
       timeout: 15000
     });
     const me = JSON.parse(await response.text());
-    return me && (me.name || me.accountId || me.displayName) ? me : null;
+    // Confluence answers an unauthenticated caller as the anonymous user, not with a 401
+    if (!me || me.type === 'anonymous') return null;
+    return me.name || me.username || me.accountId || me.displayName ? me : null;
   } catch (err) {
     return null; // HTML from the gateway, a redirect chain, a timeout: all "not yet"
   }
@@ -195,7 +200,10 @@ async function probeIdentity(context, jiraUrl, authHeader) {
  * `signal` closes the window early. The wait is a poll, so teardown lands within a second
  * of the abort rather than instantly — soon enough for a screen nobody is watching.
  */
-async function runBrowserLogin(jiraUrl, { timeoutMs = SSO_LOGIN_TIMEOUT_MS, launch, onProgress, authHeader, signal } = {}) {
+async function runBrowserLogin(jiraUrl, {
+  timeoutMs = SSO_LOGIN_TIMEOUT_MS, launch, onProgress, authHeader, signal,
+  identityPath = JIRA_IDENTITY_PATH, siteName = 'Jira'
+} = {}) {
   const report = onProgress || (() => {});
   const origin = new URL(jiraUrl).origin;
   const abandoned = () => new Error('Browser sign-in was abandoned — nobody was waiting for the window any more.');
@@ -229,15 +237,15 @@ async function runBrowserLogin(jiraUrl, { timeoutMs = SSO_LOGIN_TIMEOUT_MS, laun
         // Try the token first: if it works we are done the moment the gateway relents,
         // and the user never sees Jira's own login page. Falling back to the bare probe
         // keeps this working when there is no token, or the gateway strips the header.
-        const me = (authHeader && await probeIdentity(context, jiraUrl, authHeader))
-          || await probeIdentity(context, jiraUrl);
+        const me = (authHeader && await probeIdentity(context, jiraUrl, authHeader, identityPath))
+          || await probeIdentity(context, jiraUrl, undefined, identityPath);
         if (me) {
           return { user: me.displayName || me.name, captured: await context.cookies() };
         }
       }
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
-    throw new Error('Browser sign-in timed out before the Jira session was established.');
+    throw new Error(`Browser sign-in timed out before the ${siteName} session was established.`);
   } finally {
     await Promise.resolve(dispose()).catch(() => {});
   }

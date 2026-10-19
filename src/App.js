@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import Timeline from "./components/Timeline";
-import JiraAuthAvatar from "./components/JiraAuthAvatar";
+import Connections from "./components/Connections";
 import * as XLSX from 'xlsx';
 import { DataGrid, GridActionsCellItem } from '@mui/x-data-grid';
 import { 
@@ -38,6 +38,7 @@ import { BrowserRouter as Router, Routes, Route, Link, Navigate, useLocation } f
 import JiraMinator from './components/JiraMinator';
 import PIPlanner from './components/PIPlanner';
 import SprintPlanner from './components/SprintPlanner';
+import ConfluenceSync from './components/ConfluenceSync';
 import { debug } from './utils/debug';
 
 function parseCsvDate(dateStr) {
@@ -106,7 +107,8 @@ const PAGE_TITLES = [
   { path: '/jiraminator', label: 'JiraMinator', accent: 'Minator' },
   { path: '/jira-stories', label: 'JiraMinator', accent: 'Minator' },
   { path: '/pi-planner', label: 'PI Planner' },
-  { path: '/sprint-planner', label: 'Sprint Planner' }
+  { path: '/sprint-planner', label: 'Sprint Planner' },
+  { path: '/confluence-sync', label: 'Confluence Sync' }
 ];
 const HOME_TITLE = { path: '/', label: 'Roadmap Runner' };
 
@@ -143,9 +145,10 @@ function AppHeader() {
           <MuiMenuItem component={Link} to="/jiraminator" onClick={closeMenu}>JiraMinator</MuiMenuItem>
           <MuiMenuItem component={Link} to="/pi-planner" onClick={closeMenu}>PI Planner</MuiMenuItem>
           <MuiMenuItem component={Link} to="/sprint-planner" onClick={closeMenu}>Sprint Planner</MuiMenuItem>
+          <MuiMenuItem component={Link} to="/confluence-sync" onClick={closeMenu}>Confluence Sync</MuiMenuItem>
         </Menu>
-        {/* Jira connection state and sign-in live here rather than on each page */}
-        <JiraAuthAvatar />
+        {/* Jira and Confluence connections live here rather than on each page */}
+        <Connections />
       </Toolbar>
     </AppBar>
   );
@@ -649,6 +652,7 @@ function App() {
           <Route path="/jira-stories" element={<Navigate to="/jiraminator" replace />} />
           <Route path="/pi-planner" element={<PIPlanner />} />
           <Route path="/sprint-planner" element={<SprintPlanner />} />
+          <Route path="/confluence-sync" element={<ConfluenceSync />} />
           <Route path="/" element={
             <>
               <Box sx={{ width: '100%' }}>

@@ -64,6 +64,7 @@ import { jiraToMarkdown } from '../utils/jiraToMarkdown';
 import { planNextSprint, inferCadenceDays } from '../utils/sprintPlan';
 import useJiraAuth, { jiraAuthService } from '../hooks/useJiraAuth';
 import { debug } from '../utils/debug';
+import { openConnections } from './Connections';
 
 // The backlog is one more column on the board, and the server takes the same word as a
 // stand-in for a sprint id when moving issues out of every sprint.
@@ -836,8 +837,12 @@ export default function SprintPlanner() {
 
   if (!isAuthenticated) {
     return (
-      <Alert severity="info" sx={{ maxWidth: 640 }}>
-        Connect to Jira from the avatar in the top right to plan sprints.
+      <Alert
+        severity="info"
+        sx={{ maxWidth: 640 }}
+        action={<Button color="inherit" size="small" onClick={openConnections}>Connect</Button>}
+      >
+        Connect to Jira to plan sprints.
       </Alert>
     );
   }

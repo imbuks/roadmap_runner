@@ -44,6 +44,7 @@ in the JSON body, and the proxy holds the credentials and cookie jar.
 | `/jiraminator` | `JiraMinator.js` | The main workhorse: a DataGrid for authoring, importing, bulk-editing and publishing Jira issues |
 | `/pi-planner` | `PIPlanner.js` | PI planning views over the Feature → Epic → Story hierarchy |
 | `/sprint-planner` | `SprintPlanner.js` | Sprints as buckets or as a list: create sprints, move issues between them, peek at one |
+| `/confluence-sync` | `ConfluenceSync.js` | Publish a page bundle (manifest + storage-format XML + images) to a Confluence space |
 
 `src/components/SharePointLists.js` is empty.
 
@@ -91,6 +92,35 @@ status codes. Consequences that shape the server:
 Sessions are mirrored to `~/.roadmap-runner/sessions.json` (`0600`, 30-day TTL) including the whole
 cookie jar, because for SSO the cookies *are* the credential.
 
+A **Personal Access Token can be saved** ("Remember this token", Jira and Confluence alike;
+[server/credentials.js](server/credentials.js)), so a session that ends — the 30-day TTL, a
+`sessions.json` rewritten by another copy of the server — is quietly replaced rather than asking
+for the token again. The token is kept AES-GCM-encrypted in `~/.roadmap-runner/credentials.json`;
+the key is random bytes the browser made and keeps in `localStorage` (`roadmapVaultKey`) and sends
+with the requests that use it. The split is deliberate: the dev server listens on every interface
+with no auth of its own, so a server-only "sign in with the saved token" would sign in anyone on
+the network. The token never goes back to the browser, only its last four characters. Sign-in
+routes take `remember` (true saves, false forgets, absent leaves alone) and `useSaved` (stands in
+for a blank token field). Passwords are never saved.
+
+Both connections are managed in one place: [src/components/Connections.js](src/components/Connections.js),
+the app-bar pill (a status dot each for Jira and Confluence) and its dialog, one section per product
+since each needs its own PAT. At launch it settles both connections (`jiraAuthService.check()`,
+`confluenceService.check()`: validate the stored session, else try the saved token) and opens the
+dialog only for what is still missing. "Skip for now" holds it off for the tab (`sessionStorage`),
+not for good. Pages open it with `openConnections()` rather than carrying sign-in forms of their own.
+Confluence's state lives in a small store in `confluenceApi.js` (`useConfluenceAuth`), because the
+header, the dialog and the sync page all show it. Statuses start as `'unknown'`, and the prompt waits
+for the check, or it would open over a session that is about to turn out fine. An explicit sign-out
+sets `signedOut` on the stored credentials, so the saved token does not sign straight back in. The
+URL is kept, so the form reopens on the same site.
+
+On the client, `withSession` (Jira) and `postWithSession` (Confluence) re-sign-in with the saved
+token and retry once when the server answers "Invalid or missing … session". Only a `pat` session
+is restored unattended. A browser session needs the user, and a password is not kept. Concurrent
+failures share one re-sign-in. `validateSession` treats *only* that answer as signed out. Jira
+being unreachable at page load used to sign people out of a session that was fine.
+
 `process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'` is set at the top of `server/index.js` for corporate
 TLS interception.
 
@@ -131,6 +161,25 @@ stops the agent's greeting being mistaken for the reply.
 The conversation is stateless server-side. The browser holds the transcript and posts all of it each
 turn, alongside the *current* story read fresh from the row — so a description the user hand-edited is
 what the next turn builds on, and the transcript itself carries only the agent's prose.
+
+A reply with more than one title line is a **split**. It is cut apart by those title lines, not by
+its ``` fences (`splitByTitles`): with several stories, models fence the first and forget the rest,
+or put them all in one block, and pairing fences blindly lost stories or cut one off before its
+criteria. A broken story is named and left out rather than sinking the reply. Each is validated on its own and
+they come back as `stories` rather than `patch`, which the grid adds as new draft rows (inheriting
+epic, team, sprint and people from the row being split). The same route also backs the page-level
+**Brainstorm** drawer on `/jiraminator`, sent with `intent: 'brainstorm'`: there is no story in
+hand, so the prompt is about breaking an idea down, the "story as it stands" block is left out,
+and even a single story comes back in `stories`. Because a brainstorm's proposals *are* the subject
+of the conversation, the browser posts each assistant turn's `stories` back and the server folds the
+**latest** set into that turn (`withLatestProposals`) — without it "make the second one smaller"
+had no second one, and the model rebuilt everything or answered with nothing. The prompt makes a
+revision resend the whole set, since what comes back replaces what was there. The brainstorm takes images too (attach, paste,
+drop): scaled to 1280px in the browser, sent inline as data URLs on user turns — which is why
+`/api/agent` has its own 25mb JSON limit ahead of the global parser — and capped at the newest six
+per transcript. Ollama gets them per message; `/api/agent/status` reports `visionModels` from each
+model's `/api/show` capabilities, and a model without vision is refused up front rather than left
+to answer without having looked. Direct Line refuses images; `flow` is sent them as data URLs.
 
 Two routes need no model at all. `/api/agent/validate` is pure parsing, so the editor can show
 where a description stands against the template on every keystroke for free. `/api/agent/format`
@@ -241,6 +290,78 @@ and the only part of this page that can be checked without a browser.
 - The dialog says in words what it worked out and from where, because a guess that cannot be
   seen cannot be disagreed with. Moving the start carries the end with it: the cycle length is
   the thing being preserved.
+
+### Confluence sync
+
+A port of `cst-confluence-sync/push_to_confluence.py` (a stdlib Python script that publishes a
+Notion export to Confluence DC). The engine is [server/confluence-sync.js](server/confluence-sync.js)
+and knows nothing about HTTP routes or sessions; [server/confluence.js](server/confluence.js) holds
+the routes under `/api/confluence`. It is **interchangeable with the script on purpose**: same
+bundle, same `cst-sync` label, and the version comment `cst-sync:<hash>` is computed over the same
+bytes, so a space the script published shows as unchanged here rather than republished. Matching
+the hash means copying two Python behaviours: `json.dumps` of the labels (`", "` separators,
+non-ASCII escaped as `\uXXXX`, surrogate pairs included) and `str(None)` for a page with no parent,
+plus `read_text()` folding `\r\n` to `\n`. Change any of that and every page republishes.
+
+- **A Confluence session is an entry in the Jira session store**, with `auth.product: 'confluence'`
+  and its base URL in the `jiraUrl` field. That is how it gets the gateway recovery, persistence and
+  keepalive for free. `identityPath(auth)` is the one thing that differs: the gateway helpers, the
+  keepalive and the browser sign-in probe `/rest/api/user/current` for Confluence, because
+  Confluence's HTML 404 for `/rest/api/2/myself` would read as an interception. `forProduct`
+  rewrites "Jira" in the gateway's error messages. The `/api/jira` middleware refuses Confluence
+  sessions so one can never reach a Jira route.
+- Confluence answers bad or missing credentials as the **anonymous user** (200, `type:
+  'anonymous'`), not with a 401, so sign-in, `current-user` and the browser probe all check for that.
+- The folder is **read in the browser** ([src/utils/confluenceBundle.js](src/utils/confluenceBundle.js)
+  `readLocalBundle`), so the page list, the bundle's problems and the preview all work before
+  anything is sent, or even with Confluence not connected. The page uploads it only when a preview or
+  publish needs it, once per folder. A server restarted since is answered by sending it again. The
+  server validates it again regardless.
+- The **preview** (`renderStorage`) turns storage format into HTML: callouts, the Page Properties
+  box, expand, code, page links that open the linked page in the preview, and images from the
+  folder as object URLs. The browser's HTML parser needs two things done first: CDATA
+  becomes escaped text, and self-closed `ac:`/`ri:` tags are opened and closed, because an unknown
+  `<ri:page/>` otherwise swallows its siblings. The output is built from an allowlist of tags,
+  attributes and URL schemes (no `on*`, no `javascript:`, images only from `blob:`/`https:`), so it
+  is safe to set as innerHTML. Keep it that way when adding a macro.
+- **Selection** starts at everything, and everything selected sends no `only`, so it is the whole-bundle
+  run the script does. The Select menu picks a section (a page and all its descendants). With a
+  partial selection the preflight checks that each selected page's parent is selected or already in
+  Confluence (by state id, or by title with the `cst-sync` label), and fails up front with the
+  parents to add, marking the pages `blocked`.
+- The bundle arrives as the files of a folder picked in the browser (`webkitdirectory`), with their
+  paths in a separate `paths` field, because multipart filenames lose their directories. Its root
+  is wherever `manifest.json` is. If the folder around it holds the script's
+  `.cst-sync-state-<SPACE>.json`, those page ids seed a space this app has not published to yet.
+  Bundles are held in memory (6 h, newest five).
+- State (key → page id) lives in `~/.roadmap-runner/confluence-sync/state-<host>-<SPACE>.json`, in
+  the script's own format, and is written after every page so a run that dies halfway still
+  remembers what it created.
+- A run is a **job the browser polls** (`sync-status` with `since`, so each poll carries only new
+  log lines), one per space at a time. A first full publish is a few hundred requests. Stop takes
+  effect between pages. The job id is kept in `sessionStorage`, so a reload picks the run back up.
+- Attachments are uploaded as one prebuilt multipart `Buffer`, not a form-data stream, so a
+  bounced upload is simply retried like any other call. Every write sends
+  `X-Atlassian-Token: no-check`, which cookie-authenticated (browser) sessions need.
+- The preflight's lookups are reused by the main pass. The script asks Confluence twice per page.
+- The parent page can be given as an ID, a link, or a **title** (`resolvePage`). A
+  `/display/SPACE/Title` link carries no ID at all. A title has to match exactly, but a hyphen also
+  tries the en and em dash, since Confluence titles are often typed with a hyphen and stored with a
+  dash. A miss says why: the page is in another space (CQL `title =`), or here are close titles
+  (CQL `title ~`). Both the target check and the sync resolve the field the same way.
+- The field itself is a search box (`ParentPagePicker`, backed by `/api/confluence/search-pages`
+  and `searchPages`). It runs CQL `title ~` over the space with the last word as a prefix, falls
+  back to the plain words if the wildcard finds nothing, and lists recently modified pages when
+  empty. Each result carries its ancestors' titles, because a space can hold several "Features"
+  pages. Picked or typed, the parent is stored as `{ parentId, parentTitle }` once resolved: kept
+  by ID and shown by title. It is `freeSolo` so an ID or link can still be pasted, and since
+  freeSolo suppresses MUI's no-options and loading text, an empty list shows one disabled line
+  saying why.
+
+The page's buttons are deliberately **not** disabled while the space and parent are being checked.
+Leaving a field to click Preview starts that check, and a button that becomes disabled (or moves
+because the summary above it changed height) between mouse-down and mouse-up never gets the
+click. The old summary stays in place, dimmed, until the new one arrives.
 
 ### Descriptions
 

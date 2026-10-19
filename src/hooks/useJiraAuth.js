@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { vaultKey } from '../utils/savedTokens';
 
 // Shared Jira authentication service
 const SESSION_KEY = 'jiraSessionId';
@@ -52,6 +53,11 @@ class JiraAuthEventEmitter {
 
 const jiraAuthEmitter = new JiraAuthEventEmitter();
 
+const INVALID_SESSION = 'Invalid or missing Jira session';
+
+// Many calls fail together when a session is gone; they all wait on one re-sign-in
+let restoring = null;
+
 // Jira authentication API functions
 export const jiraAuthService = {
   // Store session in both localStorage and sessionStorage for persistence
@@ -69,11 +75,11 @@ export const jiraAuthService = {
     return localStorage.getItem(SESSION_KEY) || sessionStorage.getItem(SESSION_KEY);
   },
 
-  // Clear stored session
+  // Clear stored session. Where it was connected to stays, so signing in again starts
+  // from the same Jira, and pages that link into Jira keep their base URL.
   clearSession: () => {
     localStorage.removeItem(SESSION_KEY);
     sessionStorage.removeItem(SESSION_KEY);
-    localStorage.removeItem(JIRA_CREDENTIALS_KEY);
     jiraAuthEmitter.emit('sessionChanged', null);
   },
 
@@ -100,16 +106,22 @@ export const jiraAuthService = {
     }
   },
 
-  // Authenticate with Jira
-  authenticate: async (jiraUrl, jiraUser, jiraToken, authType = DEFAULT_AUTH_METHOD) => {
+  // Authenticate with Jira. With a PAT, `remember` keeps (true) or forgets (false) the
+  // token for next time, and `useSaved` signs in with the kept one instead of a typed one.
+  authenticate: async (jiraUrl, jiraUser, jiraToken, authType = DEFAULT_AUTH_METHOD, { remember, useSaved } = {}) => {
     const response = await fetch(`${API_BASE}/api/jira/auth`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jiraUrl, jiraUser, jiraToken, authType })
+      body: JSON.stringify({ jiraUrl, jiraUser, jiraToken, authType, remember, useSaved, vaultKey: vaultKey() })
     });
 
     if (!response.ok) {
-      const errorData = await response.json();
+      const errorData = await response.json().catch(() => ({}));
+      // A saved token Jira turns away has most likely expired; say so rather than leaving
+      // "authentication failed" to be read as a typo in a field the user never filled in
+      if (useSaved && !jiraToken && (response.status === 401 || response.status === 403)) {
+        throw new Error('Jira refused your saved token; it may have expired. Enter a new one.');
+      }
       throw new Error(errorData.error || 'Jira authentication failed');
     }
 
@@ -129,11 +141,11 @@ export const jiraAuthService = {
   // An optional Personal Access Token is passed through because the gateway and Jira
   // authenticate separately: the browser satisfies the gateway, and the token satisfies
   // Jira, so supplying one skips Jira's own login page.
-  authenticateWithBrowser: async (jiraUrl, jiraToken) => {
+  authenticateWithBrowser: async (jiraUrl, jiraToken, { remember, useSaved } = {}) => {
     const response = await fetch(`${API_BASE}/api/jira/sso-login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jiraUrl, jiraToken })
+      body: JSON.stringify({ jiraUrl, jiraToken, remember, useSaved, vaultKey: vaultKey() })
     });
 
     if (!response.ok) {
@@ -166,47 +178,103 @@ export const jiraAuthService = {
       }
     }
     jiraAuthService.clearSession();
+    // An explicit sign-out must stick: without this the saved token would sign straight
+    // back in at the next check. The next sign-in stores fresh credentials without it.
+    const creds = jiraAuthService.getStoredCredentials();
+    if (creds) jiraAuthService.storeCredentials({ ...creds, signedOut: true });
   },
 
-  // Check if session is still valid
+  // Settle whether Jira is connected: validate the stored session (re-signing in with the
+  // saved token if the server has lost it), or failing that, try the saved token outright.
+  // Resolves true or false; Jira merely being unreachable counts as connected.
+  check: async () => {
+    const sessionId = jiraAuthService.getStoredSession();
+    if (sessionId) return jiraAuthService.validateSession(sessionId);
+    return !!(await jiraAuthService.restoreSession());
+  },
+
+  // The server no longer knows this session — it expired, or was lost — so sign in again
+  // with the saved token, if there is one. Only a PAT sign-in can be repeated unattended:
+  // a browser sign-in needs the user, and a password is never kept. Resolves with the new
+  // session id, or null when there is nothing to sign in with.
+  restoreSession: () => {
+    if (!restoring) {
+      restoring = (async () => {
+        const creds = jiraAuthService.getStoredCredentials();
+        if (!creds || creds.authType !== AUTH_METHODS.PAT || !creds.jiraUrl || creds.signedOut) return null;
+        try {
+          return await jiraAuthService.authenticate(creds.jiraUrl, creds.jiraUser || '', '', AUTH_METHODS.PAT, { useSaved: true });
+        } catch (err) {
+          return null;
+        }
+      })().finally(() => { restoring = null; });
+    }
+    return restoring;
+  },
+
+  // Is the stored session still good? Only the server saying it does not know the session
+  // counts as no. Jira being unreachable — a VPN that is off, the gateway having a moment —
+  // says nothing about the session, and treating it as expired signed people out of a
+  // session that was fine, leaving them to paste their token in again.
   validateSession: async (sessionId) => {
     if (!sessionId) return false;
-    
+
     try {
       const response = await fetch(`${API_BASE}/api/jira/projects`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionId })
       });
-      
+
       if (response.status === 400) {
-        const data = await response.json();
-        if (data.error && data.error.includes('Invalid or missing Jira session')) {
+        const data = await response.json().catch(() => ({}));
+        if (data.error && data.error.includes(INVALID_SESSION)) {
+          if (await jiraAuthService.restoreSession()) return true;
           jiraAuthService.clearSession();
           return false;
         }
       }
-      
-      return response.ok;
+
+      return true;
     } catch (error) {
-      return false;
+      return true; // the proxy is down; the session will be there when it is back
     }
   },
 
+  // Send a request that names the session, signing in again with the saved token and
+  // retrying once if the server no longer knows it. `send` takes the session id and
+  // returns a fetch Response.
+  withSession: async (send) => {
+    const sessionId = jiraAuthService.getStoredSession();
+    if (!sessionId) {
+      throw new Error('No active Jira session. Please authenticate first.');
+    }
+
+    let response = await send(sessionId);
+    if (response.status === 400) {
+      const errorData = await response.clone().json().catch(() => ({}));
+      if (errorData.error && errorData.error.includes(INVALID_SESSION)) {
+        const restored = await jiraAuthService.restoreSession();
+        if (!restored) {
+          jiraAuthService.clearSession();
+          throw new Error('Session expired. Please authenticate again.');
+        }
+        response = await send(restored);
+      }
+    }
+    return response;
+  },
+
   // Fetch projects
-  fetchProjects: async (sessionId) => {
-    const response = await fetch(`${API_BASE}/api/jira/projects`, {
+  fetchProjects: async () => {
+    const response = await jiraAuthService.withSession(sessionId => fetch(`${API_BASE}/api/jira/projects`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionId })
-    });
+    }));
 
     if (!response.ok) {
-      const errorData = await response.json();
-      if (errorData.error && errorData.error.includes('Invalid or missing Jira session')) {
-        jiraAuthService.clearSession();
-        throw new Error('Session expired. Please authenticate again.');
-      }
+      const errorData = await response.json().catch(() => ({}));
       throw new Error(errorData.error || 'Failed to fetch projects');
     }
 
@@ -216,23 +284,14 @@ export const jiraAuthService = {
 
   // Generic Jira API call with session handling
   apiCall: async (endpoint, data = {}) => {
-    const sessionId = jiraAuthService.getStoredSession();
-    if (!sessionId) {
-      throw new Error('No active Jira session. Please authenticate first.');
-    }
-
-    const response = await fetch(`${API_BASE}/api/jira/${endpoint}`, {
+    const response = await jiraAuthService.withSession(sessionId => fetch(`${API_BASE}/api/jira/${endpoint}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionId, ...data })
-    });
+    }));
 
     if (!response.ok) {
-      const errorData = await response.json();
-      if (errorData.error && errorData.error.includes('Invalid or missing Jira session')) {
-        jiraAuthService.clearSession();
-        throw new Error('Session expired. Please authenticate again.');
-      }
+      const errorData = await response.json().catch(() => ({}));
       throw new Error(errorData.error || `Failed to call ${endpoint}`);
     }
 
@@ -241,28 +300,22 @@ export const jiraAuthService = {
 
   // Attach files to an existing Jira issue (multipart, so it bypasses apiCall's JSON body)
   uploadAttachments: async (issueKey, files) => {
-    const sessionId = jiraAuthService.getStoredSession();
-    if (!sessionId) {
-      throw new Error('No active Jira session. Please authenticate first.');
-    }
+    // The form is built per attempt: a retry after re-signing-in names the new session
+    const response = await jiraAuthService.withSession(sessionId => {
+      const formData = new FormData();
+      formData.append('sessionId', sessionId);
+      formData.append('issueKey', issueKey);
+      files.forEach(file => formData.append('files', file, file.name));
 
-    const formData = new FormData();
-    formData.append('sessionId', sessionId);
-    formData.append('issueKey', issueKey);
-    files.forEach(file => formData.append('files', file, file.name));
-
-    // Content-Type is intentionally omitted so the browser sets the multipart boundary
-    const response = await fetch(`${API_BASE}/api/jira/attach`, {
-      method: 'POST',
-      body: formData
+      // Content-Type is intentionally omitted so the browser sets the multipart boundary
+      return fetch(`${API_BASE}/api/jira/attach`, {
+        method: 'POST',
+        body: formData
+      });
     });
 
     if (!response.ok) {
-      const errorData = await response.json();
-      if (errorData.error && errorData.error.includes('Invalid or missing Jira session')) {
-        jiraAuthService.clearSession();
-        throw new Error('Session expired. Please authenticate again.');
-      }
+      const errorData = await response.json().catch(() => ({}));
       throw new Error(errorData.error || 'Failed to attach files');
     }
 
@@ -320,12 +373,12 @@ export const useJiraAuth = () => {
     }
   };
 
-  const authenticate = useCallback(async (jiraUrl, jiraUser, jiraToken, authType) => {
+  const authenticate = useCallback(async (jiraUrl, jiraUser, jiraToken, authType, options) => {
     setAuthLoading(true);
     setAuthError('');
 
     try {
-      const newSessionId = await jiraAuthService.authenticate(jiraUrl, jiraUser, jiraToken, authType);
+      const newSessionId = await jiraAuthService.authenticate(jiraUrl, jiraUser, jiraToken, authType, options);
       // Don't set state here - let the sessionChanged event handle it
       // This prevents double updates
       return newSessionId;
@@ -339,12 +392,12 @@ export const useJiraAuth = () => {
     }
   }, []);
 
-  const authenticateWithBrowser = useCallback(async (jiraUrl, jiraToken) => {
+  const authenticateWithBrowser = useCallback(async (jiraUrl, jiraToken, options) => {
     setAuthLoading(true);
     setAuthError('');
 
     try {
-      return await jiraAuthService.authenticateWithBrowser(jiraUrl, jiraToken);
+      return await jiraAuthService.authenticateWithBrowser(jiraUrl, jiraToken, options);
     } catch (error) {
       setAuthError(error.message);
       setIsAuthenticated(false);

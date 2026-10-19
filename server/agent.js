@@ -66,11 +66,45 @@ const MAX_TURNS = 12;       // the transcript is resent every turn; cap what it 
 const MAX_CHARS = 12000;    // per message, so one pasted essay cannot run away
 
 /*
+ * Images ride along on user turns as data URLs (a screenshot, a whiteboard photo, a
+ * mockup). The browser scales them down before sending; these caps are for a browser that
+ * did not. The newest are kept, since they are what the current question is about.
+ */
+const MAX_IMAGES = 6;                       // across the whole transcript
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;    // per image, decoded
+const IMAGE_DATA_URL = /^data:(image\/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/]+={0,2})$/;
+
+// One turn's images as { mime, data }, dropping anything that is not a plain image
+function readImages(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .map(url => IMAGE_DATA_URL.exec(typeof url === 'string' ? url : ''))
+    .filter(m => m && m[2].length * 0.75 <= MAX_IMAGE_BYTES)
+    .map(m => ({ mime: m[1], data: m[2] }));
+}
+
+// Keep only the newest MAX_IMAGES across the transcript, walking back from the latest turn
+function capImages(turns) {
+  let budget = MAX_IMAGES;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const images = turns[i].images;
+    if (!images) continue;
+    const kept = images.slice(Math.max(0, images.length - budget));
+    budget -= kept.length;
+    if (kept.length) turns[i].images = kept;
+    else delete turns[i].images;
+  }
+  return turns;
+}
+
+const imageCount = (messages) => messages.reduce((n, m) => n + (m.images ? m.images.length : 0), 0);
+
+/*
  * A stand-in that answers in the agent's own contract: a note, then the complete document
  * in a fenced block. It echoes the current story back through the template, so applying
  * its reply exercises the real parse/validate/patch path rather than a happy path.
  */
-function mockAgent({ messages, story, template }) {
+function mockAgent({ messages, story, template, intent }) {
   const shape = template || resolveTemplate({});
   const ask = [...messages].reverse().find(m => m.role === 'user');
   const askText = (ask && ask.content) || '';
@@ -115,6 +149,32 @@ function mockAgent({ messages, story, template }) {
     body
   ].join('\n');
 
+  // A brainstorm starts from an idea rather than a row, so it has no title of its own
+  const idea = askText.replace(/\s+/g, ' ').trim().slice(0, 200) || 'the idea';
+  const titled = (text) => doc.replace(/^\*\*Story Title:\*\*.*$/m, `**Story Title:** ${text}`);
+
+  if (intent === 'brainstorm') {
+    const parts = ['Capture', 'Review', 'Report on'].map(verb => titled(`${verb} ${idea}`.slice(0, 240)));
+    const seen = imageCount(messages);
+    return [
+      `(mock agent) Broke "${idea.slice(0, 80)}" into ${parts.length} stories`
+        + `${seen ? `, with ${seen} image${seen === 1 ? '' : 's'} attached (the mock cannot look at them)` : ''}.`,
+      ...parts.flatMap(p => ['', '```story', p, '```'])
+    ].join('\n');
+  }
+
+  // A split answers with one block per story, so the multi-story path can be exercised too
+  if (/\bsplit\b/i.test(askText)) {
+    const part = (n) => titled(`${title.slice(0, 225)} (part ${n})`);
+    return [
+      `(mock agent) Split the ${shape.type} into two.`,
+      '',
+      '```story', part(1), '```',
+      '',
+      '```story', part(2), '```'
+    ].join('\n');
+  }
+
   return [
     `(mock agent) Harmonized the ${shape.type} to the ${shape.label} template${askText ? ` and folded in: "${askText.slice(0, 80)}"` : ''}.`,
     '',
@@ -141,7 +201,12 @@ async function callFlow({ messages, story, context, intent, template }) {
     },
     body: JSON.stringify({
       system: buildSystemPrompt({ intent, template }),
-      messages, story, context, intent,
+      // Images go back out as the data URLs they arrived as, which is what most HTTP
+      // endpoints (and Power Automate's base64 handling) can take directly
+      messages: messages.map(m => (m.images
+        ? { ...m, images: m.images.map(img => `data:${img.mime};base64,${img.data}`) }
+        : m)),
+      story, context, intent,
       template: template && template.id
     })
   });
@@ -200,12 +265,53 @@ function storyBlock(story) {
   ].join('\n'), '```'].join('\n');
 }
 
+/*
+ * The stories the agent proposed last time, put back into its own turn.
+ *
+ * The transcript otherwise carries only the agent's prose, which is right for the story
+ * editor (the story itself is sent fresh each turn) and wrong for a brainstorm: there, the
+ * proposals *are* the thing under discussion, and a model asked to "make the second one
+ * smaller" without them either rebuilds every story from scratch or answers with no story
+ * at all. Only the latest set is put back — they are whole documents, the transcript is
+ * resent every turn, and an older set is superseded by the newer one anyway.
+ */
+const MAX_PROPOSALS = 10;
+function readProposals(list) {
+  if (!Array.isArray(list)) return [];
+  const text = (v) => (typeof v === 'string' || typeof v === 'number' ? String(v).slice(0, MAX_CHARS) : '');
+  return list.slice(0, MAX_PROPOSALS)
+    .filter(p => p && typeof p === 'object')
+    .map(p => ({ summary: text(p.summary), storyPoints: text(p.storyPoints), labels: text(p.labels), description: text(p.description) }))
+    .filter(p => p.summary || p.description);
+}
+
+function withLatestProposals(turns) {
+  const last = turns.map(t => Boolean(t.proposals)).lastIndexOf(true);
+  return turns.map((t, i) => {
+    const { proposals, ...turn } = t;
+    if (i !== last) return turn;
+    return {
+      ...turn,
+      content: [turn.content, '', `The ${proposals.length === 1 ? 'story' : 'stories'} I proposed:`, '',
+        proposals.map(storyBlock).join('\n\n')].join('\n')
+    };
+  });
+}
+
+// What the agent is told about the story in hand. A brainstorm has none — it starts from
+// an idea — and showing it an empty story would only invite it to fill that one in.
+function storyPreamble({ story, intent }) {
+  if (intent === 'brainstorm') return '';
+  return `The story as it currently stands:\n\n${storyBlock(story)}\n\n`;
+}
+
 // Everything the agent needs to answer this turn, as one message. Direct Line has no
 // notion of a system prompt or a message history, so everything is flattened into one.
 function composeTurn({ messages, story, context, intent, template }) {
   const parts = [buildSystemPrompt({ intent, template }), ''];
   if (context && context.projectKey) parts.push(`Jira project: ${context.projectKey}`, '');
-  parts.push('The story as it currently stands:', storyBlock(story), '');
+  const preamble = storyPreamble({ story, intent });
+  if (preamble) parts.push(preamble);
   parts.push('Conversation so far:');
   for (const m of messages) parts.push(`${m.role === 'user' ? 'Person' : 'You'}: ${m.content}`);
   return parts.join('\n');
@@ -214,6 +320,9 @@ function composeTurn({ messages, story, context, intent, template }) {
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function callDirectLine(payload) {
+  if (imageCount(payload.messages) > 0) {
+    throw new Error('Images cannot be sent to the Copilot Studio agent over Direct Line. Remove them, or describe what they show.');
+  }
   const token = await directLineToken();
   const auth = { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' };
 
@@ -310,16 +419,56 @@ async function listOllamaModels() {
     .filter(name => typeof name === 'string' && name);
 }
 
+/*
+ * Which installed models can read an image. Ollama reports it per model (`capabilities`
+ * from /api/show), and a model without it does not fail on an image — it quietly answers
+ * without having seen it, which is worse. Cached per name: a model's abilities do not
+ * change while it is installed, and the status call would otherwise ask every time.
+ */
+const visionCache = new Map();
+async function ollamaSeesImages(name) {
+  if (visionCache.has(name)) return visionCache.get(name);
+  try {
+    const response = await fetch(`${AGENT_OLLAMA_URL}/api/show`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: name }),
+      timeout: 3000
+    });
+    if (!response.ok) return false;
+    const data = JSON.parse(await response.text());
+    const sees = Array.isArray(data.capabilities) && data.capabilities.includes('vision');
+    visionCache.set(name, sees);
+    return sees;
+  } catch (err) {
+    return false; // not cached, so a hiccup is asked again next time
+  }
+}
+
 async function callOllama({ messages, story, context, intent, model, template }) {
   const modelName = pickOllamaModel(model);
+  if (imageCount(messages) > 0 && !(await ollamaSeesImages(modelName))) {
+    const installed = await listOllamaModels().catch(() => []);
+    const seeing = [];
+    for (const name of installed) if (await ollamaSeesImages(name)) seeing.push(name);
+    throw new Error(`${modelName} cannot read images. `
+      + (seeing.length
+        ? `Switch to ${seeing.join(' or ')}, which can.`
+        : 'Pull a vision model (gemma3, llama3.2-vision or qwen2.5vl, say) with "ollama pull".'));
+  }
   const history = messages.slice(0, -1);
   const last = messages[messages.length - 1];
   const project = context && context.projectKey ? `Jira project: ${context.projectKey}\n\n` : '';
 
   const chat = [
     { role: 'system', content: buildSystemPrompt({ intent, template }) },
-    ...history.map(m => ({ role: m.role, content: m.content })),
-    { role: 'user', content: `${project}The story as it currently stands:\n\n${storyBlock(story)}\n\n${last.content}` }
+    // Ollama takes images per message, as bare base64 with no data: prefix
+    ...history.map(m => ({ role: m.role, content: m.content, ...(m.images ? { images: m.images.map(i => i.data) } : {}) })),
+    {
+      role: 'user',
+      content: `${project}${storyPreamble({ story, intent })}${last.content}`,
+      ...(last.images ? { images: last.images.map(i => i.data) } : {})
+    }
   ];
 
   let response;
@@ -333,8 +482,9 @@ async function callOllama({ messages, story, context, intent, model, template })
         stream: false,
         options: {
           temperature: AGENT_OLLAMA_TEMPERATURE,
-          // A whole story document is a few hundred tokens; leave room and no more
-          num_predict: 2048,
+          // A whole story document is a few hundred tokens, but a split returns several of
+          // them in one reply — and a reply cut off mid-block loses that story outright
+          num_predict: Number(process.env.AGENT_OLLAMA_NUM_PREDICT) || 4096,
           /*
            * Pinned, because Ollama's default context is sized from available VRAM and can
            * land at 4096 — and the format contract sits at the *front* of this prompt, so
@@ -392,15 +542,44 @@ const callAgent = (payload) => {
 
 // Turn a raw reply into the shape the client renders: prose for the bubble, a validated
 // patch for the Apply button, and the deviations that were repaired along the way.
-function harmonize(raw, template) {
-  const { prose, document } = splitReply(raw);
-  if (!document) return { reply: prose, patch: null, violations: [], hard: [] };
+function harmonize(raw, template, intent) {
+  const { prose, documents } = splitReply(raw);
+  if (documents.length === 0) return { reply: prose, patch: null, stories: null, violations: [], hard: [] };
 
-  const doc = parseStoryDoc(document);
-  const { violations, hard } = validateStoryDoc(doc, { template });
-  if (hard.length > 0) return { reply: prose, patch: null, violations, hard };
+  // A brainstorm has no row to patch, so even a single story is one to add
+  if (documents.length === 1 && intent !== 'brainstorm') {
+    const doc = parseStoryDoc(documents[0]);
+    const { violations, hard } = validateStoryDoc(doc, { template });
+    if (hard.length > 0) return { reply: prose, patch: null, stories: null, violations, hard };
+    return { reply: prose, patch: toPatch(doc, template), stories: null, violations, hard: [] };
+  }
 
-  return { reply: prose, patch: toPatch(doc, template), violations, hard: [] };
+  /*
+   * A split or a brainstorm: several stories, each checked on its own. They are never a
+   * patch to the row being edited — they come back as `stories`, which the grid adds as
+   * rows of their own.
+   * Findings are prefixed with which story they belong to, or "AC numbering" is ambiguous.
+   */
+  const violations = [];
+  const hard = [];
+  const stories = [];
+  documents.forEach((text, i) => {
+    const doc = parseStoryDoc(text);
+    const result = validateStoryDoc(doc, { template });
+    const label = `Story ${i + 1}${docLabel(doc)}`;
+    violations.push(...result.violations.map(v => `${label}: ${v}`));
+    // One broken story does not sink the others: the sound ones are kept, and the broken
+    // one is named — hard, so it is worth a re-ask, but not a reason to show nothing
+    if (result.hard.length) hard.push(...result.hard.map(v => `${label}: ${v}`));
+    else stories.push(toPatch(doc, template));
+  });
+  return { reply: prose, patch: null, stories: stories.length ? stories : null, violations, hard };
+}
+
+// " (Export as CSV)", so a finding can be matched to a story without counting blocks
+function docLabel(doc) {
+  const title = doc.meta['story title'] || doc.meta.title || '';
+  return title ? ` ("${title.length > 50 ? `${title.slice(0, 47)}...` : title}")` : '';
 }
 
 /*
@@ -410,7 +589,7 @@ function harmonize(raw, template) {
  * than a fourth wait. Shared by the chat and the one-press format, which fail the same way.
  */
 async function askWithRepair(payload) {
-  const first = harmonize(await callAgent(payload), payload.template);
+  const first = harmonize(await callAgent(payload), payload.template, payload.intent);
   if (first.hard.length === 0) return first;
 
   debug('Story agent broke the format, re-asking:', first.hard);
@@ -419,13 +598,23 @@ async function askWithRepair(payload) {
     messages: [...payload.messages, {
       role: 'user',
       content: `Your last reply did not follow the story format: ${first.hard.join(' ')} `
-        + 'Send the complete document again in a fenced ```story block, following the format exactly, '
-        + 'with every field and criterion filled in.'
+        + (/^Story \d+:/.test(first.hard[0])
+          ? 'Send every story again, each complete in its own fenced ```story block, '
+          : 'Send the complete document again in a fenced ```story block, ')
+        + 'following the format exactly, with every field and criterion filled in.'
     }]
   };
-  const second = harmonize(await callAgent(retry), payload.template);
-  if (second.hard.length > 0) return first; // no better; report the original diagnosis
-  return { ...second, violations: [...second.violations, 'The first reply did not follow the format and was re-requested.'] };
+  const second = harmonize(await callAgent(retry), payload.template, payload.intent);
+  // Named, not just announced: a re-ask doubles the wait, and "it did not follow the
+  // format" gives nobody anything to change
+  const note = `The first reply was re-requested because: ${first.hard.join(' ')}`;
+  if (second.hard.length === 0) return { ...second, violations: [...second.violations, note] };
+
+  // Neither is clean. With several stories, whichever answer kept more of them is the one
+  // worth showing, its broken stories named rather than silently gone.
+  const kept = (r) => (r.stories ? r.stories.length : 0);
+  if (kept(second) > kept(first)) return { ...second, violations: [...second.violations, note] };
+  return first; // no better; report the original diagnosis
 }
 
 /*
@@ -447,15 +636,27 @@ function registerAgentRoutes(app) {
 
   app.post('/api/agent/chat', async (req, res) => {
     const { messages, story, context, model } = req.body || {};
+    // 'brainstorm' is the page-level assistant: an idea in, stories to add out. Anything
+    // else is the story editor's rail, refining the one row it was opened on.
+    const intent = req.body && req.body.intent === 'brainstorm' ? 'brainstorm' : 'refine';
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: 'messages is required.' });
     }
 
     // The transcript comes from the browser, so bound it here rather than trusting it
-    const turns = messages
+    const turns = withLatestProposals(capImages(messages
       .filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
       .slice(-MAX_TURNS)
-      .map(m => ({ role: m.role, content: m.content.slice(0, MAX_CHARS) }));
+      .map((m) => {
+        const turn = { role: m.role, content: m.content.slice(0, MAX_CHARS) };
+        // Only a person attaches images; an assistant turn claiming some is ignored
+        const images = m.role === 'user' ? readImages(m.images) : [];
+        if (images.length) turn.images = images;
+        // ...and only the agent proposes stories
+        const proposals = m.role === 'assistant' ? readProposals(m.stories) : [];
+        if (proposals.length) turn.proposals = proposals;
+        return turn;
+      })));
     if (turns.length === 0) {
       return res.status(400).json({ error: 'No usable messages in the transcript.' });
     }
@@ -465,13 +666,15 @@ function registerAgentRoutes(app) {
     const template = templateFor(req.body);
     const payload = {
       messages: turns, story: story || {}, context: context || {},
-      intent: 'refine', model, template
+      intent, model, template
     };
 
     try {
       const result = await askWithRepair(payload);
 
-      if (result.hard.length > 0) {
+      // Stories that passed are still offered when others did not; the ones left out are
+      // named in the violations, so a partial answer is never mistaken for a whole one
+      if (result.hard.length > 0 && !result.stories) {
         return res.json({
           reply: result.reply || 'The agent did not return a story in the expected format.',
           patch: null,
@@ -479,10 +682,25 @@ function registerAgentRoutes(app) {
           template: template.id
         });
       }
+      if (result.hard.length > 0) {
+        return res.json({
+          reply: result.reply,
+          patch: null,
+          stories: result.stories,
+          // Every finding already carries its story's number and title; say what they mean
+          violations: [
+            'Stories named below did not follow the format and were left out; ask again for those.',
+            ...result.violations
+          ],
+          template: template.id
+        });
+      }
 
       res.json({
         reply: result.reply,
         patch: result.patch,
+        // Set instead of patch when the reply split the story: each is a new row's fields
+        stories: result.stories,
         violations: result.violations,
         template: template.id
       });
@@ -572,9 +790,14 @@ function registerAgentRoutes(app) {
         const models = await listOllamaModels();
         // Ollama running with nothing pulled cannot answer, so do not offer the assistant:
         // every turn would fail on a model that is not there.
+        const visionModels = [];
+        for (const name of models) if (await ollamaSeesImages(name)) visionModels.push(name);
         return res.json({
           available: models.length > 0,
           mode: AGENT_MODE,
+          // Which of them can be sent an image, so the UI can say so before a turn fails
+          visionModels,
+          images: visionModels.length > 0,
           // The env default when it is actually installed, reported under its full tag so
           // the picker shows the same name as the list. Otherwise the first installed model,
           // rather than opening on a name every request then fails on.
@@ -589,7 +812,8 @@ function registerAgentRoutes(app) {
     const configured = AGENT_MODE === 'mock'
       || (AGENT_MODE === 'flow' && Boolean(AGENT_URL))
       || (AGENT_MODE === 'directline' && Boolean(AGENT_TOKEN_ENDPOINT || AGENT_DIRECTLINE_SECRET));
-    res.json({ available: configured, mode: AGENT_MODE });
+    // A flow endpoint is sent images and may do what it likes with them; Direct Line is not
+    res.json({ available: configured, mode: AGENT_MODE, images: AGENT_MODE !== 'directline' });
   });
 }
 
