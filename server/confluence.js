@@ -1,7 +1,7 @@
 /*
  * Confluence: signing in, and publishing a page bundle (see confluence-sync.js).
  *
- * A Confluence session is an ordinary entry in the server's session store — the same
+ * A Confluence session is an ordinary entry in the session handler (session-manager.js) — the same
  * cookie jar, the same gateway recovery, the same persistence and keepalive — marked
  * `auth.product: 'confluence'` so the gateway code probes Confluence's identity endpoint
  * rather than Jira's. The store's `jiraUrl` field holds the Confluence base URL; it is
@@ -19,6 +19,10 @@ const {
   readBundle, summarizeBundle, runSync, resolvePage, searchPages, ConfluenceClient, SyncStopped
 } = require('./confluence-sync');
 const { tokenFor, afterSignIn, NOT_SAVED } = require('./credentials');
+const {
+  jiraSessions: sessions, createSession, getSession, removeSession, saveSessions,
+  makeJiraFetch: makeFetch, buildAuthHeader, errorStatus
+} = require('./session-manager');
 
 const IDENTITY_PATH = '/rest/api/user/current';
 const NO_SESSION = 'Invalid or missing Confluence session. Please sign in to Confluence first.';
@@ -62,14 +66,11 @@ function writeState(file, state) {
   fs.writeFileSync(file, JSON.stringify(state, null, 1), { mode: 0o600 });
 }
 
-function registerConfluenceRoutes(app, { sessions, saveSessions, makeFetch, buildAuthHeader, loginWithBrowser, upload }) {
+function registerConfluenceRoutes(app, { loginWithBrowser, upload }) {
   const bundles = new Map(); // id -> { bundle, summary, createdAt }
   const jobs = new Map();    // id -> job (see startJob)
 
-  const sessionFor = id => {
-    const s = id && sessions[id];
-    return s && s.auth && s.auth.product === 'confluence' ? s : null;
-  };
+  const sessionFor = id => getSession(id, 'confluence');
 
   const clientFor = session => new ConfluenceClient({
     fetch: makeFetch(session.jar, session.jiraUrl, session.auth),
@@ -77,12 +78,7 @@ function registerConfluenceRoutes(app, { sessions, saveSessions, makeFetch, buil
     authHeader: buildAuthHeader(session.auth)
   });
 
-  const remember = (jar, base, auth) => {
-    const sessionId = uuidv4();
-    sessions[sessionId] = { jar, jiraUrl: base, auth, createdAt: Date.now(), lastUsedAt: Date.now() };
-    saveSessions();
-    return sessionId;
-  };
+  const remember = (jar, base, auth) => createSession({ jar, jiraUrl: base, auth });
 
   const prune = () => {
     const now = Date.now();
@@ -125,7 +121,7 @@ function registerConfluenceRoutes(app, { sessions, saveSessions, makeFetch, buil
       if (authType === 'pat') afterSignIn('confluence', base, req.body, token);
       res.json({ sessionId, user: me.displayName || me.username, baseUrl: base });
     } catch (err) {
-      res.status(err.status === 401 ? 401 : 500).json({ error: err.message });
+      res.status(err.status === 401 ? 401 : errorStatus(err)).json({ error: err.message });
     }
   });
 
@@ -154,7 +150,7 @@ function registerConfluenceRoutes(app, { sessions, saveSessions, makeFetch, buil
       if (!res.writableEnded) res.json({ sessionId, user: summary.user, baseUrl: base });
     } catch (err) {
       if (gaveUp.signal.aborted) return console.log(`Browser sign-in dropped: ${err.message}`);
-      res.status(500).json({ error: err.message });
+      res.status(errorStatus(err)).json({ error: err.message });
     }
   });
 
@@ -166,15 +162,12 @@ function registerConfluenceRoutes(app, { sessions, saveSessions, makeFetch, buil
       if (!me || me.type === 'anonymous') return res.status(401).json({ error: 'Your Confluence sign-in has expired.' });
       res.json({ user: me.displayName || me.username, baseUrl: session.jiraUrl, authType: session.auth.authType });
     } catch (err) {
-      res.status(err.status === 401 ? 401 : 500).json({ error: err.message });
+      res.status(err.status === 401 ? 401 : errorStatus(err)).json({ error: err.message });
     }
   });
 
   app.post('/api/confluence/logout', (req, res) => {
-    if (sessionFor(req.body.sessionId)) {
-      delete sessions[req.body.sessionId];
-      saveSessions();
-    }
+    if (sessionFor(req.body.sessionId)) removeSession(req.body.sessionId);
     res.json({ ok: true });
   });
 
@@ -203,7 +196,7 @@ function registerConfluenceRoutes(app, { sessions, saveSessions, makeFetch, buil
         tracked: state && state.pages ? Object.keys(state.pages).length : 0
       });
     } catch (err) {
-      res.status(err.status === 400 || err.status === 404 ? err.status : 500).json({ error: err.message });
+      res.status(err.status === 400 || err.status === 404 ? err.status : errorStatus(err)).json({ error: err.message });
     }
   });
 
@@ -216,7 +209,7 @@ function registerConfluenceRoutes(app, { sessions, saveSessions, makeFetch, buil
     try {
       res.json({ pages: await searchPages(clientFor(session), space, req.body.query) });
     } catch (err) {
-      res.status(err.status === 401 ? 401 : 500).json({ error: err.message });
+      res.status(err.status === 401 ? 401 : errorStatus(err)).json({ error: err.message });
     }
   });
 

@@ -32,7 +32,8 @@ warnings, and errors):
 
 ## Architecture
 
-A CRA front end plus an Express proxy (`server/index.js`, ~1900 lines, one file). Nothing in the
+A CRA front end plus an Express proxy (`server/index.js` for the routes, with sessions and the
+gateway in `server/session-manager.js`). Nothing in the
 browser talks to Jira directly — every call goes to `POST /api/jira/<endpoint>` with a `sessionId`
 in the JSON body, and the proxy holds the credentials and cookie jar.
 
@@ -60,7 +61,11 @@ one was supplied, otherwise *null* — `jiraFetch` drops empty headers).
 
 The dominant complication in this codebase is that the target Jira sits behind an **F5 BIG-IP APM
 gateway** that strips `Authorization` and answers intercepted requests with HTML under arbitrary
-status codes. Consequences that shape the server:
+status codes. Everything that deals with it lives in
+[server/session-manager.js](server/session-manager.js), the session handler: the store and its
+copy on disk, `makeJiraFetch` and its recovery, the keepalive, and each session's state. Routes
+only ask it for a session by id (`getSession(id, product)`) and a fetch for it. Consequences that
+shape the server:
 
 - `classifyInterception` treats *any* HTML body on a `/rest/` call as an interception (Jira's REST API
   never returns HTML), classifying it `'sso'` (needs a real browser) or `'apm'` (recoverable).
@@ -91,6 +96,19 @@ status codes. Consequences that shape the server:
 
 Sessions are mirrored to `~/.roadmap-runner/sessions.json` (`0600`, 30-day TTL) including the whole
 cookie jar, because for SSO the cookies *are* the credential.
+
+**One session per site.** Every sign-in mints a fresh `sessionId` (the id is the bearer secret,
+so it is never handed out any other way — the server has no auth of its own), but all ids for the
+same product + URL point at one shared record: one jar, one credential, so one gateway recovery and
+one sign-in window across tabs. Signing in again refreshes the session for ids issued earlier;
+signing out signs the whole site out. `sessions.json` keeps its old one-entry-per-id shape (so the
+Docker copy and older builds still read it) and ids are regrouped by site on load.
+
+A gateway failure is thrown as a `GatewayError` (`status: 502`, `code`: `sso-required` |
+`gateway` | `retry`), and routes answer with `errorStatus(err)` — so a 502 means "the gateway is
+in the way" and a 500 means the server itself failed. `POST /api/session/status` reports what a
+session's last request found (`unchecked` | `signed-in` | `recovering` | `signing-in` |
+`needs-sign-in`, plus `lastError`) without sending anything to the gateway, so it is safe to poll.
 
 A **Personal Access Token can be saved** ("Remember this token", Jira and Confluence alike;
 [server/credentials.js](server/credentials.js)), so a session that ends — the 30-day TTL, a

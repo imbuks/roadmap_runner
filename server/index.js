@@ -3,15 +3,11 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 const { loadAgentEnv } = require('./env');
 const agentEnvKeys = loadAgentEnv();
 const express = require('express');
-const fetch = require('node-fetch');
-const fetchCookie = require('fetch-cookie');
 const tough = require('tough-cookie');
 const cors = require('cors');
-const { v4: uuidv4 } = require('uuid');
 const multer = require('multer');
 const FormData = require('form-data');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const { loginWithBrowser } = require('./browser-login');
 const { registerAgentRoutes } = require('./agent');
@@ -37,451 +33,13 @@ app.use(cors());
 app.use('/api/agent', express.json({ limit: '25mb' }));
 app.use(express.json());
 
-// Session store: { [sessionId]: { jar, jiraUrl, auth, createdAt } }
-const jiraSessions = {};
-
-// Sessions are mirrored to disk so restarting the server does not force everyone to
-// re-enter their token. The file holds Jira credentials, so it lives in the user's home
-// directory (never the repo, where it could be committed), is readable only by them,
-// and entries expire so an abandoned token does not linger forever.
-const SESSION_DIR = path.join(os.homedir(), '.roadmap-runner');
-const SESSION_FILE = path.join(SESSION_DIR, 'sessions.json');
-const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-
-function saveSessions() {
-  try {
-    fs.mkdirSync(SESSION_DIR, { recursive: true, mode: 0o700 });
-    const data = {};
-    Object.entries(jiraSessions).forEach(([id, session]) => {
-      data[id] = {
-        jiraUrl: session.jiraUrl,
-        auth: session.auth,
-        createdAt: session.createdAt,
-        lastUsedAt: session.lastUsedAt,
-        // Keep the whole jar, gateway session cookies included: for an SSO session they
-        // *are* the credential, and re-earning one costs the user a browser sign-in. A
-        // cookie that has since lapsed is no longer a hazard — classifyInterception spots
-        // the gateway's reply and the session is re-established automatically.
-        cookies: session.jar && typeof session.jar.toJSON === 'function' ? session.jar.toJSON() : null
-      };
-    });
-    fs.writeFileSync(SESSION_FILE, JSON.stringify(data), { mode: 0o600 });
-    // writeFileSync/mkdirSync only apply their mode when creating, so tighten explicitly
-    // in case the file or directory already existed with looser permissions
-    fs.chmodSync(SESSION_FILE, 0o600);
-    fs.chmodSync(SESSION_DIR, 0o700);
-  } catch (err) {
-    // Losing persistence is not fatal; the session still works until the next restart
-    console.warn('Could not persist Jira sessions:', err.message);
-  }
-}
-
-function loadSessions() {
-  try {
-    if (!fs.existsSync(SESSION_FILE)) return;
-    const data = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
-    const now = Date.now();
-    let expired = 0;
-    Object.entries(data).forEach(([id, session]) => {
-      if (!session || !session.auth || !session.jiraUrl) return;
-      if (session.createdAt && now - session.createdAt > SESSION_TTL_MS) {
-        expired++;
-        return;
-      }
-      let jar;
-      try {
-        jar = session.cookies ? tough.CookieJar.fromJSON(session.cookies) : new tough.CookieJar();
-      } catch (err) {
-        jar = new tough.CookieJar(); // a corrupt jar just means re-negotiating cookies
-      }
-      jiraSessions[id] = {
-        jar,
-        jiraUrl: session.jiraUrl,
-        auth: session.auth,
-        createdAt: session.createdAt || now,
-        lastUsedAt: session.lastUsedAt || session.createdAt || now
-      };
-    });
-    const restored = Object.keys(jiraSessions).length;
-    console.log(`Restored ${restored} Jira session(s) from ${SESSION_FILE}${expired ? ` (${expired} expired)` : ''}`);
-    if (expired) saveSessions();
-  } catch (err) {
-    console.warn('Could not read stored Jira sessions:', err.message);
-  }
-}
-
-/**
- * Build the correct Authorization header for a session's stored credentials.
- * - 'pat'   : Jira Data Center/Server Personal Access Token -> Bearer auth (no username)
- * - 'basic' : username + password/token -> Basic auth (default, legacy behaviour)
- * - 'sso'   : signed in through the browser. The gateway is satisfied by the captured
- *             cookies; Jira is satisfied by a token if one was supplied, and otherwise by
- *             its own session cookie. Returns null in that second case, and jiraFetch
- *             drops headers with no value.
- */
-function buildAuthHeader(auth) {
-  if (!auth) return null;
-  if (auth.authType === 'sso') {
-    return auth.jiraToken ? 'Bearer ' + auth.jiraToken : null;
-  }
-  if (auth.authType === 'pat') {
-    return 'Bearer ' + auth.jiraToken;
-  }
-  return 'Basic ' + Buffer.from(`${auth.jiraUser}:${auth.jiraToken}`).toString('base64');
-}
-
-/*
- * --- Talking to a Jira that sits behind an F5 BIG-IP APM gateway --------------------
- *
- * When the gateway's own session lapses it does not pass the request through to Jira and
- * it does not return a clean HTTP error. It answers the request itself with an HTML
- * portal page under whatever status it likes (404 is common), so an untreated response
- * reaches the UI as a baffling "Jira API error 404" full of markup.
- *
- * Two things make that happen here:
- *   - the gateway's cookies are short-lived, but we persist the whole jar for 30 days,
- *     so a server restart replays a long-dead gateway session;
- *   - several requests are usually in flight at once, and each one that arrives without
- *     a valid gateway session starts its own access policy evaluation. The gateway only
- *     tolerates one, and answers the rest with "Access policy evaluation is already in
- *     progress for your current session."
- *
- * So: recognise the gateway's pages, and re-establish its session exactly once no matter
- * how many requests hit the wall together. Where the policy demands interactive SSO, the
- * only thing that can satisfy it is a browser — see server/browser-login.js.
- */
-
-// The gateway hands back an interactive single sign-on flow: an auto-posting SAML form,
-// an OIDC bounce, or its own logon page. No Authorization header can satisfy any of them.
-const SSO_MARKERS = [
-  /SAMLRequest/,
-  /login\.microsoftonline\.com/i,
-  /\/my\.policy/i,
-  /name=["']?(username|password)["']?/i,
-  /openid-configuration|oauth2\/authorize/i
-];
-
-const APM_BUSY_MARKER = /Access policy evaluation is already in progress/i;
-const APM_MARKERS = [/BIG-IP/i, /F5 Networks/i, /Access policy evaluation/i, /\/vdesk\//i];
-
-const SSO_MESSAGE =
-  'Jira is behind an F5 BIG-IP gateway that requires interactive single sign-on (SAML via ' +
-  'Microsoft Entra ID). It rejected the request before Jira ever saw it, and a Jira API token ' +
-  'cannot satisfy it. Use "Sign in with browser", or connect to the corporate network/VPN ' +
-  'where the gateway lets API traffic through.';
-
-// The same wall, met by a session that already signed in through the browser: the advice
-// about tokens and VPNs is beside the point, and signing in again is the only way on.
-const SSO_EXPIRED_MESSAGE =
-  'Your Jira sign-in has expired and signing in again did not get past the network ' +
-  'gateway (F5 BIG-IP). Use "Sign in with browser" to start a fresh session.';
-
-const APM_MESSAGE =
-  'Jira is unreachable: the network gateway (F5 BIG-IP) answered instead of Jira. ' +
-  'This usually means the VPN/SSO session has expired — reconnect to the VPN, then sign in to Jira again.';
-
-/**
- * Classify a response that came back from the gateway rather than from Jira.
- *
- * The rule is deliberately broad: every call here asks a /rest/ endpoint for JSON, and
- * Jira's REST API never answers those with HTML. So any HTML body means something in the
- * path intercepted the request — regardless of the status code, which the gateway sets to
- * whatever it likes (a 404 on its error page, and a cheerful 200 on its SSO redirect).
- *
- * Returns null when the response really is Jira's, otherwise:
- *   'sso'  - an interactive login flow. Unrecoverable from a server; fail fast.
- *   'apm'  - a gateway session problem. Worth re-establishing and retrying.
- */
-function classifyInterception(response, body) {
-  const contentType = response.headers.get('content-type') || '';
-  const isHtml = /html/i.test(contentType) || /^\s*<(!doctype|html)/i.test(body);
-  if (!isHtml) return null;
-  if (APM_BUSY_MARKER.test(body)) return 'apm';
-  if (SSO_MARKERS.some(marker => marker.test(body))) return 'sso';
-  if (APM_MARKERS.some(marker => marker.test(body))) return 'apm';
-  // HTML where JSON was promised, from something that did not identify itself. Treat it
-  // as a recoverable gateway hiccup; if it persists the retry limit reports it anyway.
-  return 'apm';
-}
-
-/*
- * Per-session gateway state, keyed by that session's cookie jar:
- *   recovery   - the re-handshake currently in flight, if any
- *   generation - bumped each time one completes, so a request that was already in the
- *                air when the session was re-established knows to simply retry instead
- *                of tearing down the freshly minted session and starting over.
- */
-const gatewayState = new WeakMap();
-
-function gatewayStateFor(jar) {
-  let state = gatewayState.get(jar);
-  if (!state) {
-    state = { recovery: null, generation: 0 };
-    gatewayState.set(jar, state);
-  }
-  return state;
-}
-
-// The session store holds Confluence sessions too (auth.product === 'confluence'; see
-// server/confluence.js). Everything that asks the gateway "is the session alive" goes
-// through the product's own who-am-I endpoint — Confluence has no /rest/api/2/myself, and
-// its error page for one would read as an interception — and its messages name the right
-// product.
-const IDENTITY_PATHS = { jira: '/rest/api/2/myself', confluence: '/rest/api/user/current' };
-const identityPath = auth => IDENTITY_PATHS[auth && auth.product] || IDENTITY_PATHS.jira;
-const productName = auth => (auth && auth.product === 'confluence' ? 'Confluence' : 'Jira');
-const forProduct = (message, auth) =>
-  productName(auth) === 'Jira' ? message : message.replace(/\bJira\b/g, productName(auth));
-
-// An 'sso' session sends no Authorization header at all, so drop empty ones rather
-// than letting "Authorization: null" go out on the wire.
-const withoutEmptyHeaders = headers =>
-  Object.fromEntries(Object.entries(headers || {}).filter(([, value]) => value != null));
-
-// Ask a cheap endpoint what, if anything, is standing in front of Jira. Used when a
-// request failed in a way that left no response to classify — a redirect node-fetch
-// would not follow. Unlike priming, it disturbs nothing: no cookies are cleared.
-async function probeInterception(fetchWithCookies, jiraUrl, auth) {
-  try {
-    const response = await fetchWithCookies(`${jiraUrl}${identityPath(auth)}`, {
-      headers: withoutEmptyHeaders({ 'Authorization': buildAuthHeader(auth), 'Accept': 'application/json' }),
-      redirect: 'follow'
-    });
-    return classifyInterception(response, await response.text());
-  } catch (err) {
-    // No answer is not a clean bill of health: treat it as the gateway misbehaving
-    return 'apm';
-  }
-}
-
-// Drop the stale gateway cookies, then send one cheap request on its own so the gateway
-// can run its access policy through to completion without competition. Its own request
-// can lose a race too, so give it a few tries before leaving it to the caller's retry.
-// A browser session keeps its cookies: they are the credential, and clearing them turns
-// a hiccup into a sign-in that could otherwise have been avoided.
-async function primeGatewaySession(jar, fetchWithCookies, jiraUrl, auth) {
-  if (!auth || auth.authType !== 'sso') {
-    await new Promise(resolve => jar.removeAllCookies(() => resolve()));
-  }
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const response = await fetchWithCookies(`${jiraUrl}${identityPath(auth)}`, {
-        headers: withoutEmptyHeaders({ 'Authorization': buildAuthHeader(auth), 'Accept': 'application/json' }),
-        redirect: 'follow'
-      });
-      const kind = classifyInterception(response, await response.text());
-      // Anything that is not an interception means the gateway let us through, so the
-      // session is established — even a genuine Jira error, which the caller will see.
-      if (!kind) return;
-      // No number of retries produces a browser session, so stop rather than hammer it.
-      if (kind === 'sso') return 'sso';
-    } catch (err) {
-      // Transport failure: fall through and wait before trying again.
-    }
-    await new Promise(resolve => setTimeout(resolve, 150 * (attempt + 1)));
-  }
-}
-
-// Re-establish the gateway session, unless another request got there first while this
-// one was failing. `work` returns the recovery strategy to run; going through the shared
-// slot means a burst of failing requests produces one recovery, not one each — which for
-// a browser sign-in is the difference between one window and a dozen.
-async function recoverGatewaySession(state, generation, work) {
-  if (state.generation > generation) return null;
-  if (!state.recovery) {
-    state.recovery = work()
-      .catch(err => ({ error: err }))
-      .then(result => {
-        state.generation++;
-        state.recovery = null;
-        return result;
-      });
-  }
-  return state.recovery;
-}
-
-// An SSO session is re-earned by signing in again, which only a browser can do. Sessions
-// created that way carry authType 'sso', so the server knows re-opening a window is what
-// the user signed up for rather than a surprise.
-async function reloginWithBrowser(jar, jiraUrl, auth) {
-  const summary = await loginWithBrowser(jiraUrl, jar, {
-    authHeader: buildAuthHeader(auth),
-    identityPath: identityPath(auth),
-    siteName: productName(auth),
-    onProgress: where => console.log(`  browser sign-in is at: ${where}`)
-  });
-  saveSessions(); // the refreshed cookies are the credential; keep them across restarts
-  console.log(`Re-established the ${productName(auth)} browser session for ${summary.user}`);
-  return summary;
-}
-
-const MAX_GATEWAY_ATTEMPTS = 3;
-
-/**
- * A cookie-aware fetch for one Jira session that transparently recovers from the gateway
- * in front of it. Call sites read `ok`, `status` and `text()`, and the body has to be
- * buffered here to inspect it, so it hands back that shape rather than a spent Response.
- */
-function makeJiraFetch(jar, jiraUrl, auth) {
-  const fetchWithCookies = fetchCookie(fetch, jar);
-  const buffered = (response, body) => ({
-    ok: response.ok,
-    status: response.status,
-    statusText: response.statusText,
-    text: async () => body
-  });
-
-  const state = gatewayStateFor(jar);
-  // A streamed body (a file upload) cannot be sent twice, so such a request is recovered
-  // but not retried here — resending it would send an empty form. Call sites able to
-  // build a fresh copy pass `newBody` instead, and are retried like anything else.
-  const replayable = body => !body || typeof body === 'string' || Buffer.isBuffer(body);
-
-  return async function jiraFetch(url, options = {}) {
-    // `newBody` is a factory returning { body, headers } — a multipart body carries its
-    // own boundary in a Content-Type header, so the two have to be rebuilt together.
-    const { newBody, ...rest } = options;
-    const buildRequest = () => {
-      if (!newBody) return { ...rest, headers: withoutEmptyHeaders(rest.headers) };
-      const fresh = newBody();
-      return {
-        ...rest,
-        body: fresh.body,
-        headers: withoutEmptyHeaders({ ...rest.headers, ...fresh.headers })
-      };
-    };
-
-    for (let attempt = 0; ; attempt++) {
-      // If the gateway session is already being re-established, wait for it rather than
-      // racing it — competing evaluations are exactly what the gateway rejects.
-      if (state.recovery) await state.recovery;
-      const generation = state.generation;
-      const request = buildRequest();
-
-      // A redirect cannot be followed while the body is a stream (fetch-cookie throws, and
-      // the Location is lost with it), so a streamed request takes its redirect by hand.
-      const streamed = !!request.body && typeof request.body.pipe === 'function';
-      const response = await fetchWithCookies(url, streamed ? { ...request, redirect: 'manual' } : request);
-      const body = await response.text();
-
-      let kind;
-      if (streamed && response.status >= 300 && response.status < 400) {
-        // Jira answers these calls with JSON and never redirects, so the gateway is the
-        // only thing this can be. Say where it pointed: the query is left out, since a
-        // SAML redirect carries a signed request in it.
-        const location = response.headers.get('location');
-        const target = location ? (u => u.origin + u.pathname)(new URL(location, url)) : '(no Location)';
-        console.warn(`Gateway redirected ${request.method || 'GET'} ${new URL(url).pathname}: ${response.status} → ${target}`);
-        kind = await probeInterception(fetchWithCookies, jiraUrl, auth);
-        // The gateway sometimes bounces a request through its policy check and straight
-        // back. Every other call follows that without noticing; an upload cannot, and the
-        // probe above has just made the trip for it. So the session is fine: send the
-        // upload again rather than re-establishing a session that needs nothing, which
-        // would cost a sign-in for no reason.
-        if (!kind) {
-          if (!newBody) {
-            throw new Error(forProduct('The network gateway in front of Jira interrupted this upload. Please try again.', auth));
-          }
-          if (attempt >= MAX_GATEWAY_ATTEMPTS) {
-            throw new Error(forProduct(`The network gateway in front of Jira keeps turning this upload away ` +
-              `(${response.status} → ${target}), although the Jira session itself is working.`, auth));
-          }
-          continue;
-        }
-      } else {
-        kind = classifyInterception(response, body);
-        if (!kind) return buffered(response, body);
-      }
-
-      // Only a browser can complete an SSO flow. A session that was established that way
-      // can re-open one; anything else has nothing left to try, so report it now rather
-      // than spending three rounds of retries arriving at the same wall.
-      const canReopenBrowser = auth && auth.authType === 'sso';
-      if (kind === 'sso' && !canReopenBrowser) throw new Error(forProduct(SSO_MESSAGE, auth));
-      if (attempt >= MAX_GATEWAY_ATTEMPTS) {
-        if (kind !== 'sso') throw new Error(forProduct(APM_MESSAGE, auth));
-        throw new Error(forProduct(canReopenBrowser ? SSO_EXPIRED_MESSAGE : SSO_MESSAGE, auth));
-      }
-
-      // Whichever failing request gets here first picks the recovery for all of them, and
-      // under a burst one may see the SAML redirect while another sees the gateway's
-      // "evaluation already in progress" page. So a gentle recovery that turns out to be
-      // facing a sign-in escalates to the browser itself — otherwise a browser session
-      // would be told that no token can help, and never be offered a window.
-      const recovered = await recoverGatewaySession(state, generation, async () => {
-        if (kind !== 'sso') {
-          const primed = await primeGatewaySession(jar, fetchWithCookies, jiraUrl, auth);
-          if (primed !== 'sso' || !canReopenBrowser) return primed;
-        }
-        return reloginWithBrowser(jar, jiraUrl, auth);
-      });
-
-      if (recovered === 'sso') throw new Error(forProduct(SSO_MESSAGE, auth));
-      // A browser sign-in that failed outright (cancelled, timed out) is the user's
-      // answer, so surface it instead of silently retrying.
-      if (recovered && recovered.error) throw recovered.error;
-
-      if (!newBody && !replayable(request.body)) {
-        throw new Error(forProduct('The network gateway in front of Jira ended this session. It has been re-established — please try again.', auth));
-      }
-    }
-  };
-}
-
-/*
- * --- Keeping a browser-established session alive -------------------------------------
- *
- * An access gateway enforces two separate timeouts. The inactivity one — commonly 15-30
- * minutes — is what makes a session feel like it expires "after a while", and it resets
- * on any request. So while the app is in use, poll quietly and the session simply never
- * lapses. (The other, a hard maximum session lifetime, cannot be extended by anything;
- * when that one fires a fresh sign-in is genuinely required.)
- *
- * Only sessions in active use are kept warm. Once the app has been idle for a couple of
- * hours the pinging stops and the gateway session is allowed to lapse on its own, rather
- * than holding a corporate SSO session open indefinitely on an unattended machine.
- */
-// Tunable, because gateway inactivity timeouts vary between deployments: the ping only
-// helps if it lands comfortably inside whatever window yours enforces.
-const KEEPALIVE_INTERVAL_MS = Number(process.env.JIRA_KEEPALIVE_MS) || 5 * 60 * 1000;
-const KEEPALIVE_MAX_IDLE_MS = Number(process.env.JIRA_KEEPALIVE_MAX_IDLE_MS) || 2 * 60 * 60 * 1000;
-
-async function keepSessionsAlive() {
-  const now = Date.now();
-  let refreshed = 0;
-
-  for (const [id, session] of Object.entries(jiraSessions)) {
-    // Only browser sessions lapse this way; token auth re-authenticates on every request.
-    if (!session.auth || session.auth.authType !== 'sso') continue;
-    if (now - (session.lastUsedAt || session.createdAt || 0) > KEEPALIVE_MAX_IDLE_MS) continue;
-
-    try {
-      // Deliberately the raw cookie-aware fetch, not jiraFetch: a background ping must
-      // never pop a sign-in window at someone who is not looking at the app.
-      const headers = { 'Accept': 'application/json' };
-      const authHeader = buildAuthHeader(session.auth);
-      if (authHeader) headers.Authorization = authHeader;
-      const response = await fetchCookie(fetch, session.jar)(`${session.jiraUrl}${identityPath(session.auth)}`, {
-        headers,
-        redirect: 'follow'
-      });
-      if (classifyInterception(response, await response.text())) {
-        console.log(`${productName(session.auth)} session ${id.slice(0, 8)}… has lapsed; the next request will ask for a new sign-in.`);
-      } else {
-        refreshed++;
-      }
-    } catch (err) {
-      // A transient network failure is not worth reporting; try again next tick.
-    }
-  }
-
-  if (refreshed) saveSessions(); // the gateway may have rolled its cookie
-}
-
-setInterval(keepSessionsAlive, KEEPALIVE_INTERVAL_MS);
+const {
+  jiraSessions, createSession, getSession, removeSession, sessionStatus, loadSessions,
+  startKeepalive, makeJiraFetch, buildAuthHeader, errorStatus
+} = require('./session-manager');
 
 // Any call that names a session counts as activity, which is what decides whether the
-// session is worth keeping warm above.
+// session is worth keeping warm (see keepSessionsAlive in session-manager.js).
 app.use('/api/jira', (req, res, next) => {
   const session = req.body && jiraSessions[req.body.sessionId];
   // A Confluence session shares the store but would only send Jira paths to Confluence.
@@ -504,6 +62,14 @@ app.use('/api/jira', (req, res, next) => {
  */
 app.get('/api/sign-in-viewer', (req, res) => {
   res.json({ url: process.env.ROADMAP_SIGNIN_VIEWER_URL || null });
+});
+
+// Where a session stands, for Jira and Confluence alike, from what its last request found.
+// It sends nothing to the gateway, so the UI can poll it — to show "signing in…" while a
+// window is open, or "sign in again" before the next action fails — at no cost.
+// state: none | unchecked | signed-in | recovering | signing-in | needs-sign-in
+app.post('/api/session/status', (req, res) => {
+  res.json(sessionStatus(req.body && req.body.sessionId));
 });
 
 app.post('/api/jira/auth', async (req, res) => {
@@ -537,14 +103,11 @@ app.post('/api/jira/auth', async (req, res) => {
       const rawText = await response.text();
       return res.status(response.status).json({ error: 'Jira authentication failed', body: rawText });
     }
-    // Store session
-    const sessionId = uuidv4();
-    jiraSessions[sessionId] = { jar, jiraUrl, auth, createdAt: Date.now(), lastUsedAt: Date.now() };
-    saveSessions();
+    const sessionId = createSession({ jar, jiraUrl, auth });
     if (authType === 'pat') afterSignIn('jira', jiraUrl, req.body, jiraToken);
     res.json({ sessionId });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(errorStatus(err)).json({ error: err.message });
   }
 });
 
@@ -585,9 +148,7 @@ app.post('/api/jira/sso-login', async (req, res) => {
       signal: gaveUp.signal,
       onProgress: where => console.log(`  browser sign-in is at: ${where}`)
     });
-    const sessionId = uuidv4();
-    jiraSessions[sessionId] = { jar, jiraUrl, auth, createdAt: Date.now(), lastUsedAt: Date.now() };
-    saveSessions();
+    const sessionId = createSession({ jar, jiraUrl, auth });
     console.log(`Browser sign-in established a Jira session for ${summary.user} (${summary.cookies.join(', ')})`);
     if (jiraToken) afterSignIn('jira', jiraUrl, req.body, jiraToken);
     // The session is worth keeping even if the client hung up mid-sign-in: it was earned,
@@ -598,7 +159,7 @@ app.post('/api/jira/sso-login', async (req, res) => {
       console.log(`Browser sign-in dropped: ${err.message}`);
       return; // the socket is gone; there is nobody to tell
     }
-    res.status(500).json({ error: err.message });
+    res.status(errorStatus(err)).json({ error: err.message });
   }
 });
 
@@ -629,17 +190,13 @@ app.post('/api/jira/current-user', async (req, res) => {
     // Same shape as /reporters, so the client can match one against the other
     res.json({ user: { key: me.accountId || me.name, name: me.displayName || me.name || '' } });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
 // Sign out: forget the session in memory and on disk, so the stored token is removed
 app.post('/api/jira/logout', (req, res) => {
-  const { sessionId } = req.body;
-  if (sessionId && jiraSessions[sessionId]) {
-    delete jiraSessions[sessionId];
-    saveSessions();
-  }
+  if (getSession(req.body.sessionId, 'jira')) removeSession(req.body.sessionId);
   res.json({ ok: true });
 });
 
@@ -668,7 +225,7 @@ app.post('/api/jira/projects', async (req, res) => {
     const projects = data.map(project => ({ key: project.key, name: project.name }));
     res.json({ projects });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -769,7 +326,7 @@ app.post('/api/jira/teams', async (req, res) => {
 
     res.json({ teams, fieldId: teamField.id });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -799,7 +356,7 @@ app.post('/api/jira/reporters', async (req, res) => {
     // Return displayName and accountId/name
     res.json({ reporters: users.map(u => ({ key: u.accountId || u.name, name: u.displayName })) });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -853,7 +410,7 @@ app.post('/api/jira/application-cis', async (req, res) => {
     }
     res.json({ applicationCIs: appCIs });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -881,7 +438,7 @@ app.post('/api/jira/boards', async (req, res) => {
     const boards = (boardsData.values || []).map(b => ({ id: b.id, name: b.name, type: b.type }));
     res.json({ boards });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -958,7 +515,7 @@ app.post('/api/jira/sprints', async (req, res) => {
     if (err instanceof JiraApiError) {
       return res.status(err.status).json({ error: jiraErrorMessage(err.body), status: err.status, body: err.body });
     }
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -1003,7 +560,7 @@ app.post('/api/jira/sprint-issues', async (req, res) => {
     if (err instanceof JiraApiError) {
       return res.status(err.status).json({ error: jiraErrorMessage(err.body), status: err.status, body: err.body });
     }
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -1052,7 +609,7 @@ app.post('/api/jira/create-sprint', async (req, res) => {
       }
     });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -1091,7 +648,7 @@ app.post('/api/jira/move-issues', async (req, res) => {
     }
     res.json({ moved: keys.length, sprintId });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -1144,7 +701,7 @@ app.post('/api/jira/sprint-state', async (req, res) => {
       }
     });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -1192,7 +749,7 @@ app.post('/api/jira/sprint-field-options', async (req, res) => {
     const sprints = (optionsData.values || []).map(opt => ({ id: opt.id, name: opt.value }));
     res.json({ sprints });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -1236,7 +793,7 @@ app.post('/api/csv/upload', async (req, res) => {
       rowCount: parsedData.length 
     });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -1273,7 +830,7 @@ app.post('/api/jira/versions', async (req, res) => {
     }));
     res.json({ versions: versionList });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -1321,7 +878,7 @@ app.post('/api/jira/features', async (req, res) => {
     if (err instanceof JiraApiError) {
       return res.status(err.status).json({ error: err.message, status: err.status, body: err.body });
     }
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -1354,7 +911,7 @@ app.post('/api/jira/debug-epic', async (req, res) => {
     debug('Complete Epic payload fields:', Object.keys(data.fields));
     res.json({ epic: data });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -1473,7 +1030,7 @@ app.post('/api/jira/epics', async (req, res) => {
     
     res.json({ epics });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -1524,7 +1081,7 @@ app.post('/api/jira/stories', async (req, res) => {
     
     res.json({ stories });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -1558,7 +1115,7 @@ app.post('/api/jira/issue-types', async (req, res) => {
       .map(it => ({ id: it.id, name: it.name, iconUrl: it.iconUrl || '' }));
     res.json({ issueTypes });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -1729,7 +1286,7 @@ app.post('/api/jira/get-issue', async (req, res) => {
     if (err instanceof JiraApiError) {
       return res.status(err.status).json({ error: err.message, status: err.status, body: err.body });
     }
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -1761,7 +1318,7 @@ app.post('/api/jira/epic-issues', async (req, res) => {
     if (err instanceof JiraApiError) {
       return res.status(err.status).json({ error: err.message, status: err.status, body: err.body });
     }
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -1884,7 +1441,7 @@ app.post('/api/jira/create-story', async (req, res) => {
     if (err instanceof JiraApiError) {
       return res.status(err.status).json({ error: err.message, status: err.status, body: err.body });
     }
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -1928,7 +1485,7 @@ app.post('/api/jira/update-story', async (req, res) => {
     if (err instanceof JiraApiError) {
       return res.status(err.status).json({ error: err.message, status: err.status, body: err.body });
     }
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -1964,7 +1521,7 @@ app.post('/api/jira/feature-epics', async (req, res) => {
     if (err instanceof JiraApiError) {
       return res.status(err.status).json({ error: err.message, status: err.status, body: err.body });
     }
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -2031,7 +1588,7 @@ app.post('/api/jira/search-epics', async (req, res) => {
     if (err instanceof JiraApiError) {
       return res.status(err.status).json({ error: err.message, status: err.status, body: err.body });
     }
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -2126,7 +1683,7 @@ app.post('/api/jira/application-ci-options', async (req, res) => {
     if (err instanceof JiraApiError) {
       return res.status(err.status).json({ error: err.message, status: err.status, body: err.body });
     }
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -2169,7 +1726,7 @@ app.post('/api/jira/transitions', async (req, res) => {
     }
     res.json({ transitions, errors });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -2221,7 +1778,7 @@ app.post('/api/jira/transition-issue', async (req, res) => {
     }
     res.json({ key, status, statusCategory });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -2276,7 +1833,7 @@ app.post('/api/jira/attach', upload.array('files'), async (req, res) => {
     const attached = JSON.parse(attachText);
     res.json({ attachments: (attached || []).map(a => ({ id: a.id, filename: a.filename, size: a.size })) });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(errorStatus(err)).json({ error: err.message, stack: err.stack });
   }
 });
 
@@ -2284,14 +1841,7 @@ app.post('/api/jira/attach', upload.array('files'), async (req, res) => {
 // keepalive middleware on that prefix has nothing to do for it.
 registerAgentRoutes(app);
 registerCredentialRoutes(app);
-registerConfluenceRoutes(app, {
-  sessions: jiraSessions,
-  saveSessions,
-  makeFetch: makeJiraFetch,
-  buildAuthHeader,
-  loginWithBrowser,
-  upload
-});
+registerConfluenceRoutes(app, { loginWithBrowser, upload });
 
 // Serve the built UI from this same origin, which is how the Docker image runs: one
 // published port covers both the app and the proxy, and the browser needs no CORS hop.
@@ -2311,6 +1861,7 @@ if (process.env.SERVE_UI === '1') {
 }
 
 loadSessions();
+startKeepalive();
 
 app.listen(PORT, () => {
   console.log(`Jira proxy server running on port ${PORT}`);
